@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$DIR/linear-board"
+T=(tmux -L linear-board -f "$DIR/board.tmux.conf")
+
+for c in tmux jq go claude; do
+  command -v "$c" >/dev/null || { echo "$c missing (macOS: brew install $c · Arch: sudo pacman -S $c)"; exit 1; }
+done
+
+rebuilt=0
+if [ ! -x "$BIN" ] || [ -n "$(find "$DIR" -maxdepth 1 -name '*.go' -newer "$BIN")" ]; then
+  (cd "$DIR" && go build -o "$BIN" .)
+  rebuilt=1
+fi
+"$BIN" check || exit 1
+
+if ! "${T[@]}" has-session -t board 2>/dev/null; then
+  exec "${T[@]}" new-session -s board -n board "$BIN"
+fi
+pane=$("${T[@]}" list-panes -s -t board -F '#{pane_id} #{pane_current_command}' | awk '$2 == "linear-board" { print $1; exit }')
+if [ -z "$pane" ]; then
+  "${T[@]}" new-window -t board -n board "$BIN"
+elif [ "$rebuilt" = 1 ]; then
+  "${T[@]}" respawn-pane -k -t "$pane" "$BIN"
+fi
+"${T[@]}" source-file "$DIR/board.tmux.conf"
+"${T[@]}" select-window -t board:board
+exec "${T[@]}" attach -t board
