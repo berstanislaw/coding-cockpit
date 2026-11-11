@@ -1,10 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 )
 
 type focus int
@@ -24,6 +27,7 @@ const (
 	focusBoard focus = iota
 	focusStrip
 	focusNew
+	focusAsk
 )
 
 type tab int
@@ -33,11 +37,12 @@ const (
 	tabSessions
 	tabReviews
 	tabDaily
+	tabSettings
 )
 
 const freeKey = "free"
 
-var tabNames = []string{"kanban", "sessions", "reviews", "daily"}
+var tabNames = []string{"kanban", "sessions", "reviews", "daily", "settings"}
 
 var (
 	priorities = []string{"", "urgent", "high", "medium", "low"}
@@ -58,6 +63,7 @@ var (
 		"background": lipgloss.NewStyle().Foreground(lipgloss.Color("#58a6ff")),
 		"stopped":    dim,
 	}
+	prStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a7bb8"))
 	stateGlyph = map[string]string{"working": "●", "waiting": "◉", "background": "◐", "stopped": "○"}
 	stateIcon  = map[string]string{
 		"working":    stateStyle["working"].Render(stateGlyph["working"]),
@@ -92,6 +98,7 @@ type (
 		rec           *Session
 		err           error
 	}
+	doneMsg      []string
 	tickMsg      struct{}
 	boardTickMsg struct{}
 )
@@ -118,15 +125,34 @@ type model struct {
 	loading     bool
 	paneFocused bool
 	err         error
+	linearPRs   map[string][]string
 	daily       string
 	dailyAt     time.Time
 	dailyBusy   bool
 	dailyVP     viewport.Model
 	dailyW      int
+	settings    Settings
+	states      []State
+	setSel      int
+	showKeys    bool
+	prs         []PR
+	prSel       int
+	openPR      *PR
+	reviews     map[string]*Review
+	thread      int
+	ask         textinput.Model
+	askKind     string
+	busy        map[string]bool
+	generating  map[string]bool
+	sending     map[string]bool
+	labelPool   []string
+	prsLoading  bool
+	rvp         viewport.Model
+	rvpKey      string
 }
 
-func loadBoardCmd() tea.Cmd {
-	return func() tea.Msg { issues, err := fetchBoard(); return boardMsg{issues, err} }
+func loadBoardCmd(sources []string) tea.Cmd {
+	return func() tea.Msg { issues, err := fetchBoard(sources); return boardMsg{issues, err} }
 }
 
 func loadDetailCmd(key string) tea.Cmd {
@@ -142,6 +168,16 @@ func refreshStateCmd() tea.Cmd {
 		}
 		sessions, err := loadSessions()
 		return stateMsg{live, readStatus(), untitled, sessions, err}
+	}
+}
+
+func doneCmd(keys []string) tea.Cmd {
+	return func() tea.Msg {
+		done, err := fetchDone(keys)
+		if err != nil || len(done) == 0 {
+			return nil
+		}
+		return doneMsg(done)
 	}
 }
 
@@ -187,7 +223,7 @@ func openURL(url string) {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadBoardCmd(), refreshStateCmd(), tick(), boardTick())
+	return tea.Batch(loadBoardCmd(m.settings.sources()), refreshStateCmd(), tick(), boardTick())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -200,18 +236,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.BlurMsg:
 		m.paneFocused = false
 	case boardTickMsg:
-		return m, tea.Batch(loadBoardCmd(), boardTick())
+		cmds := []tea.Cmd{loadBoardCmd(m.settings.sources()), boardTick()}
+		if m.tab == tabReviews {
+			cmds = append(cmds, prsCmd(m.settings.ReviewLabels))
+		}
+		return m, tea.Batch(cmds...)
 	case boardMsg:
 		m.loading, m.err = false, msg.err
 		if msg.err == nil {
 			m.issues = msg.issues
+			m.linearPRs = map[string][]string{}
+			for _, i := range msg.issues {
+				if prs := issuePRs(i); len(prs) > 0 {
+					m.linearPRs[i.Identifier] = prs
+				}
+			}
 			m.buildColumns()
 			for _, i := range msg.issues {
 				if m.ticket != nil && i.Identifier == m.ticket.Identifier {
 					m.ticket.State, m.ticket.Title, m.ticket.Priority = i.State, i.Title, i.Priority
 				}
 			}
+			var gone []string
+			for key := range m.sessions {
+				if key != freeKey && !isPRKey(key) && !slices.ContainsFunc(msg.issues, func(i Issue) bool { return i.Identifier == key }) {
+					gone = append(gone, key)
+				}
+			}
+			if len(gone) > 0 {
+				cmd = doneCmd(gone)
+			}
 		}
+	case prsMsg, reviewMsg, askMsg, sentMsg:
+		m = m.updateReviews(msg)
+	case doneMsg:
+		m.forget(msg)
+	case statesMsg:
+		m.states = msg
 	case detailMsg:
 		if msg.err != nil {
 			m.err = msg.err
@@ -275,6 +336,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fitViewport()
 	case m.tab == tabDaily:
 		m.fitDaily()
+	case m.tab == tabReviews:
+		m.fitReviews()
 	default:
 		m.ta.SetWidth(m.inner())
 		m.ta.SetHeight(5)
@@ -298,7 +361,7 @@ func (m model) dailyKey(k tea.KeyMsg) (model, tea.Cmd) {
 	case "r":
 		if !m.dailyBusy {
 			m.dailyBusy = true
-			return m, dailyCmd(true)
+			return m, dailyCmd(true, m.settings.language())
 		}
 		return m, nil
 	}
@@ -332,6 +395,11 @@ func (m model) switchTab(t tab) model {
 		}
 	case tabSessions:
 		pane = m.bestPane(freeKey)
+	case tabReviews:
+		m.focus = focusBoard
+		if m.openPR != nil && m.openPR.Mine {
+			pane = m.bestPane(prKey(*m.openPR))
+		}
 	}
 	var err error
 	if pane != "" {
@@ -347,33 +415,53 @@ func (m model) switchTab(t tab) model {
 
 func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 	key := k.String()
+	if m.showKeys {
+		m.showKeys = false
+		return m, nil
+	}
+	typing := m.focus == focusNew || m.focus == focusAsk || m.searching
 	switch key {
 	case "ctrl+c":
 		return m, tea.Quit
-	case "1", "2", "3", "4":
-		if m.focus == focusNew || m.searching {
+	case "?":
+		if !typing {
+			m.showKeys = true
+			return m, nil
+		}
+	case "1", "2", "3", "4", "5":
+		if typing {
 			break
 		}
 		fallthrough
-	case "alt+1", "alt+2", "alt+3", "alt+4":
-		m = m.switchTab(tab(key[len(key)-1] - '1'))
-		if m.tab == tabDaily && !m.dailyBusy && m.dailyAt.Format(time.DateOnly) != time.Now().Format(time.DateOnly) {
+	case "alt+1", "alt+2", "alt+3", "alt+4", "alt+5":
+		t := tab(key[len(key)-1] - '1')
+		if m.settings.tabHidden(t) {
+			return m, nil
+		}
+		m = m.switchTab(t)
+		switch {
+		case m.tab == tabSettings:
+			return m, tea.Batch(statesCmd(m.issues), prsCmd(m.settings.ReviewLabels))
+		case m.tab == tabReviews:
+			m.prsLoading = true
+			return m, prsCmd(m.settings.ReviewLabels)
+		case m.tab == tabDaily && !m.dailyBusy && m.dailyAt.Format(time.DateOnly) != time.Now().Format(time.DateOnly):
 			m.dailyBusy = true
-			return m, dailyCmd(false)
+			return m, dailyCmd(false, m.settings.language())
 		}
 		return m, nil
+	}
+	if m.tab == tabSettings {
+		return m.settingsKey(key)
 	}
 	if m.tab == tabDaily {
 		return m.dailyKey(k)
 	}
-	if m.tab == tabReviews {
-		if key == "q" {
-			return m, tea.Quit
-		}
-		return m, nil
-	}
 	confirm := m.pending
 	m.pending = ""
+	if m.tab == tabReviews && m.focus != focusNew {
+		return m.reviewsKey(k, confirm)
+	}
 	switch {
 	case m.focus == focusNew:
 		switch key {
@@ -417,6 +505,10 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 		return m.openTicket(false)
 	case "n":
 		return m.openTicket(true)
+	case "p":
+		if i := m.selectedIssue(); i != nil {
+			m.openPRs(i.Identifier)
+		}
 	case "tab", "alt+down":
 		if m.ticket != nil {
 			m.focus = focusStrip
@@ -428,7 +520,7 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 		return m, m.search.Focus()
 	case "r":
 		m.loading = true
-		return m, loadBoardCmd()
+		return m, loadBoardCmd(m.settings.sources())
 	case "o":
 		if i := m.selectedIssue(); i != nil {
 			openURL(i.URL)
@@ -442,9 +534,14 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 
 func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 	key0, list := m.listKey(), m.listSessions()
+	prs := m.prsFor(key0)
 	var s *Session
-	if m.sel >= 0 && m.sel < len(list) {
-		s = &list[m.sel]
+	pr := ""
+	switch i := m.sel - len(prs); {
+	case m.sel >= 0 && m.sel < len(prs):
+		pr = prs[m.sel]
+	case i >= 0 && i < len(list):
+		s = &list[i]
 	}
 	pane, live := "", false
 	if s != nil {
@@ -455,19 +552,23 @@ func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "esc", "tab", "alt+up":
-		if m.tab == tabKanban {
+		if m.tab == tabKanban || m.tab == tabReviews {
 			m.focus = focusBoard
 		}
 	case "up", "k":
 		m.sel = max(0, m.sel-1)
 	case "down", "j":
-		m.sel = max(0, min(len(list)-1, m.sel+1))
+		m.sel = max(0, min(len(prs)+len(list)-1, m.sel+1))
 	case "pgdown", "ctrl+d", " ":
 		m.vp.HalfPageDown()
 	case "pgup", "ctrl+u":
 		m.vp.HalfPageUp()
 	case "n":
 		return m, m.startNew()
+	case "p":
+		if inTicket {
+			m.openPRs(m.ticket.Identifier)
+		}
 	case "o":
 		if inTicket {
 			openURL(m.ticket.URL)
@@ -477,6 +578,9 @@ func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 			return m, loadDetailCmd(m.ticket.Identifier)
 		}
 	case "enter":
+		if pr != "" {
+			openURL(pr)
+		}
 		if s == nil {
 			break
 		}
@@ -558,6 +662,31 @@ func (m *model) startNew() tea.Cmd {
 	return m.ta.Focus()
 }
 
+func (m model) prsFor(key string) []string {
+	var fromTicket []string
+	if m.ticket != nil && m.ticket.Identifier == key {
+		fromTicket = issuePRs(*m.ticket)
+	}
+	var out []string
+	for _, u := range slices.Concat(fromTicket, m.linearPRs[key]) {
+		if !slices.Contains(out, u) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func (m *model) openPRs(key string) {
+	prs := m.prsFor(key)
+	if len(prs) == 0 {
+		m.err = fmt.Errorf("%s has no PRs in Linear", key)
+		return
+	}
+	for _, url := range prs {
+		openURL(url)
+	}
+}
+
 func (m model) submit() (model, tea.Cmd) {
 	key, request := m.listKey(), m.ta.Value()
 	list := m.sessions[key]
@@ -575,6 +704,13 @@ func (m model) submit() (model, tea.Cmd) {
 		}
 	}
 	previous := previousSessions(list, m.live)
+	if isPRKey(key) && m.openPR != nil {
+		p := *m.openPR
+		return m, func() tea.Msg {
+			pane, err := launch(rec.ID, title, "--session-id", rec.ID, "-n", title, prPrompt(p, request, previous))
+			return launchedMsg{key: key, id: rec.ID, pane: pane, rec: &rec, err: err}
+		}
+	}
 	return m, func() tea.Msg {
 		issue, err := fetchIssue(key)
 		if err != nil {
@@ -605,13 +741,40 @@ func (m *model) removeSession(key, id string) {
 	}
 	os.Remove(statusDir + "/" + id)
 	m.sessions = sessions
-	m.sel = max(0, min(m.sel, len(sessions[key])-1))
+	m.sel = max(0, min(m.sel, len(m.prsFor(key))+len(sessions[key])-1))
+}
+
+func (m *model) forget(keys []string) {
+	var ids []string
+	sessions, err := mutateSessions(func(s map[string][]Session) {
+		for _, key := range keys {
+			s[key] = slices.DeleteFunc(s[key], func(x Session) bool {
+				_, live := m.live[x.ID]
+				if !live {
+					ids = append(ids, x.ID)
+				}
+				return !live
+			})
+			if len(s[key]) == 0 {
+				delete(s, key)
+			}
+		}
+	})
+	if err != nil {
+		m.err = err
+		return
+	}
+	for _, id := range ids {
+		os.Remove(statusDir + "/" + id)
+	}
+	m.sessions = sessions
+	m.sel = max(0, min(m.sel, len(m.prsFor(m.listKey()))+len(sessions[m.listKey()])-1))
 }
 
 func (m *model) selectSession(id string) {
 	for i, s := range m.listSessions() {
 		if s.ID == id {
-			m.sel = i
+			m.sel = len(m.prsFor(m.listKey())) + i
 		}
 	}
 }
@@ -620,6 +783,11 @@ func (m model) listKey() string {
 	switch {
 	case m.tab == tabSessions:
 		return freeKey
+	case m.tab == tabReviews:
+		if m.openPR != nil && m.openPR.Mine {
+			return prKey(*m.openPR)
+		}
+		return ""
 	case m.ticket != nil:
 		return m.ticket.Identifier
 	}
@@ -679,6 +847,9 @@ func (m *model) buildColumns() {
 		if q != "" && !strings.Contains(strings.ToLower(i.Identifier+" "+i.Title), q) {
 			continue
 		}
+		if slices.Contains(m.settings.HiddenColumns, i.State.Name) {
+			continue
+		}
 		k, ok := index[i.State.Name]
 		if !ok {
 			k = len(m.cols)
@@ -687,19 +858,7 @@ func (m *model) buildColumns() {
 		}
 		m.cols[k].items = append(m.cols[k].items, i)
 	}
-	order := func(t string) int {
-		if o, ok := stateOrder[t]; ok {
-			return o
-		}
-		return 9
-	}
-	sort.SliceStable(m.cols, func(a, b int) bool {
-		sa, sb := m.cols[a].state, m.cols[b].state
-		if order(sa.Type) != order(sb.Type) {
-			return order(sa.Type) < order(sb.Type)
-		}
-		return sa.Position < sb.Position
-	})
+	slices.SortStableFunc(m.cols, func(a, b column) int { return stateCmp(a.state, b.state) })
 	weight := func(p float64) float64 {
 		if p == 0 {
 			return 5
@@ -726,6 +885,16 @@ func (m *model) buildColumns() {
 		}
 	}
 	m.clamp()
+}
+
+func stateCmp(a, b State) int {
+	order := func(t string) int {
+		if o, ok := stateOrder[t]; ok {
+			return o
+		}
+		return 9
+	}
+	return cmp.Or(cmp.Compare(order(a.Type), order(b.Type)), cmp.Compare(a.Position, b.Position))
 }
 
 func (m *model) clamp() {
@@ -831,41 +1000,96 @@ func (m model) View() string {
 	if m.w == 0 {
 		return ""
 	}
-	switch m.tab {
-	case tabSessions:
-		help := "↑↓ select · enter show · n new session · x stop · d remove · alt+→ claude · q quit"
-		if m.focus == focusNew {
-			help = "ctrl+s open session · esc cancel"
+	var body string
+	switch {
+	case m.showKeys:
+		body = m.box("keys", true, m.h-4, m.keysView())
+	case m.tab == tabSessions:
+		body = m.box("sessions", true, m.h-4, strings.Join(m.sessionLines(), "\n"))
+	case m.tab == tabReviews:
+		body = m.reviewsView()
+	case m.tab == tabDaily:
+		body = m.box("daily", true, m.h-4, m.dailyTop()+"\n"+m.dailyVP.View())
+	case m.tab == tabSettings:
+		body = m.box("settings", true, m.h-4, m.settingsView(m.h-4))
+	default:
+		stripH := 0
+		if m.ticket != nil {
+			stripH = m.stripHeight()
 		}
-		return strings.Join([]string{m.header(), m.box("sessions", true, m.h-4, strings.Join(m.sessionLines(), "\n")), dim.Render(ansi.Truncate(help, m.w, "…"))}, "\n")
-	case tabReviews:
-		return strings.Join([]string{m.header(), m.box("reviews", true, m.h-4, "\n  "+dim.Render("work in progress · nothing here yet")), dim.Render("alt+1 kanban · alt+2 sessions · q quit")}, "\n")
-	case tabDaily:
-		return strings.Join([]string{m.header(), m.box("daily", true, m.h-4, m.dailyTop()+"\n"+m.dailyVP.View()), dim.Render("↑↓ scroll · r regenerate · q quit")}, "\n")
-	}
-	help := "←→↑↓ move · enter open · o open in browser · n new session · / search · r refresh · q quit"
-	stripH := 0
-	if m.ticket != nil {
-		stripH = m.stripHeight()
-		help = "←→↑↓ move · enter open · o open in browser · n new session · alt+↓ ticket · esc close ticket · alt+→ claude"
-		switch m.focus {
-		case focusStrip:
-			help = "↑↓ session · enter show · o open in browser · n new · x stop · d remove · pgup/pgdn scroll · alt+↑ board"
-		case focusNew:
-			help = "ctrl+s open session · esc cancel"
+		boardH := m.h - 2 - stripH
+		body = m.box("kanban", m.focus == focusBoard, boardH-2, m.viewColumns(boardH-2))
+		if m.ticket != nil {
+			body += "\n" + m.box("ticket", m.focus != focusBoard, stripH-2, m.stripTop()+"\n"+m.vp.View())
 		}
 	}
-	boardH := m.h - 2 - stripH
-	parts := []string{m.header(), m.box("kanban", m.focus == focusBoard, boardH-2, m.viewColumns(boardH-2))}
-	if m.ticket != nil {
-		parts = append(parts, m.box("ticket", m.focus != focusBoard, stripH-2, m.stripTop()+"\n"+m.vp.View()))
+	return strings.Join([]string{m.header(), body, m.footer()}, "\n")
+}
+
+type keyHelp struct {
+	key, desc string
+	short     bool
+}
+
+func (m model) keyHelp() []keyHelp {
+	tabs := keyHelp{"alt+1…5", "switch tabs", false}
+	claude := keyHelp{"alt+→", "go to the Claude session", false}
+	quit := keyHelp{"q", "quit", false}
+	stop := keyHelp{"x x", "stop the session", false}
+	remove := keyHelp{"d d", "remove the session", false}
+	switch {
+	case m.tab == tabReviews:
+		return m.reviewKeys()
+	case m.tab == tabDaily:
+		return []keyHelp{{"r", "regenerate", true}, {"↑↓", "scroll", false}, tabs, quit}
+	case m.tab == tabSettings:
+		return []keyHelp{{"space", "toggle", true}, {"←→", "change language", true}, {"↑↓", "move", false}, tabs, quit}
+	case m.focus == focusNew:
+		return []keyHelp{{"ctrl+s", "start the session", true}, {"esc", "cancel", true}}
+	case m.searching:
+		return []keyHelp{{"enter", "keep the search", true}, {"esc", "clear", true}}
+	case m.tab == tabSessions:
+		return []keyHelp{{"enter", "show", true}, {"n", "new session", true}, {"↑↓", "select", false}, stop, remove, claude, tabs, quit}
+	case m.focus == focusStrip:
+		return []keyHelp{{"enter", "show / open PR", true}, {"n", "new session", true}, {"p", "open PRs", true}, {"↑↓", "select", false}, {"o", "open in browser", false}, stop, remove, {"pgup/pgdn", "scroll the ticket", false}, {"r", "reload the ticket", false}, {"alt+↑ / esc", "back to the kanban", false}, claude, tabs, quit}
 	}
-	return strings.Join(append(parts, dim.Render(ansi.Truncate(help, m.w, "…"))), "\n")
+	keys := []keyHelp{{"enter", "open", true}, {"n", "new session", true}, {"/", "search", true}, {"←→↑↓", "move", false}, {"p", "open PRs", false}, {"o", "open in browser", false}, {"r", "refresh", false}}
+	if m.ticket != nil {
+		keys = append(keys, keyHelp{"alt+↓ / tab", "ticket panel", false}, keyHelp{"esc", "close the ticket", false}, claude)
+	}
+	return append(keys, tabs, quit)
+}
+
+func (m model) footer() string {
+	if m.showKeys {
+		return dim.Render("any key closes")
+	}
+	var parts []string
+	for _, k := range m.keyHelp() {
+		if k.short {
+			parts = append(parts, k.key+" "+k.desc)
+		}
+	}
+	if m.focus != focusNew && m.focus != focusAsk && !m.searching {
+		parts = append(parts, "? keys")
+	}
+	return dim.Render(ansi.Truncate(strings.Join(parts, " · "), m.w, "…"))
+}
+
+func (m model) keysView() string {
+	lines := []string{""}
+	for _, k := range m.keyHelp() {
+		lines = append(lines, "  "+bold.Render(k.key)+strings.Repeat(" ", max(2, 14-lipgloss.Width(k.key)))+k.desc)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m model) header() string {
 	header := ""
 	for i, name := range tabNames {
+		if m.settings.tabHidden(tab(i)) {
+			continue
+		}
 		label := fmt.Sprintf(" %d %s ", i+1, name)
 		if tab(i) == m.tab {
 			header += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ffffff")).Background(accent).Render(label)
@@ -905,17 +1129,28 @@ func (m model) viewColumns(height int) string {
 		return dim.Render("no issues")
 	}
 	first, fit, cw := m.colWindow()
-	visible := max(1, (height-1)/5)
+	cardH := func(i Issue) int { return lipgloss.Height(m.card(i, cw, false)) }
 	var blocks []string
 	for c := first; c < min(n, first+fit); c++ {
 		col := m.cols[c]
 		head := lipgloss.NewStyle().Foreground(lipgloss.Color(col.state.Color)).Render("●") + " " + bold.Render(col.state.Name) + dim.Render(fmt.Sprintf(" %d", len(col.items)))
 		lines := []string{ansi.Truncate(head, cw, "…")}
 		offset := 0
-		if c == m.col && m.row >= visible {
-			offset = m.row - visible + 1
+		if c == m.col {
+			need := 0
+			for r := 0; r <= m.row && r < len(col.items); r++ {
+				need += cardH(col.items[r])
+			}
+			for offset < m.row && need > height-1 {
+				need -= cardH(col.items[offset])
+				offset++
+			}
 		}
-		for r := offset; r < min(len(col.items), offset+visible); r++ {
+		used := 0
+		for r := offset; r < len(col.items); r++ {
+			if used += cardH(col.items[r]); used > height-1 && r > offset {
+				break
+			}
 			lines = append(lines, m.card(col.items[r], cw, c == m.col && r == m.row))
 		}
 		if c > first {
@@ -935,6 +1170,15 @@ func (m model) card(i Issue, cw int, cursor bool) string {
 	if b := m.badge(i.Identifier); b != "" {
 		meta += " " + b
 	}
+	body := clampLines(i.Title, inner, 2)
+	if prs := m.prsFor(i.Identifier); len(prs) > 0 {
+		tags := make([]string, len(prs))
+		for k, url := range prs {
+			tags[k] = prStyle.Render(prTag(url))
+		}
+		titleLines := min(2, len(strings.Split(ansi.Wordwrap(i.Title, inner, ""), "\n")))
+		body = clampLines(i.Title, inner, titleLines) + "\n" + ansi.Truncate(strings.Join(tags, " "), inner, "…")
+	}
 	style := cardStyle
 	switch {
 	case cursor && m.focus == focusBoard && m.paneFocused:
@@ -944,7 +1188,7 @@ func (m model) card(i Issue, cw int, cursor bool) string {
 	case cursor:
 		style = style.BorderForeground(lipgloss.Color("#8b919c"))
 	}
-	return style.Width(cw - 2).Render(ansi.Truncate(meta, inner, "…") + "\n" + clampLines(i.Title, inner, 2))
+	return style.Width(cw - 2).Render(ansi.Truncate(meta, inner, "…") + "\n" + body)
 }
 
 func (m model) badge(key string) string {
@@ -996,15 +1240,22 @@ func (m model) sessionLines() []string {
 	}
 	w := m.inner()
 	list := m.listSessions()
+	prs := m.prsFor(m.listKey())
+	cursorAt := func(idx int) string {
+		if idx == m.sel && m.focus == focusStrip {
+			return lipgloss.NewStyle().Foreground(accent).Render("▸ ")
+		}
+		return "  "
+	}
 	var lines []string
+	for idx, url := range prs {
+		lines = append(lines, ansi.Truncate(cursorAt(idx)+prStyle.Render("PR")+" "+prLabel(url), w, "…"))
+	}
 	if len(list) == 0 {
 		lines = append(lines, dim.Render("no sessions · n to start one"))
 	}
 	for idx, s := range list {
-		cursor := "  "
-		if idx == m.sel && m.focus == focusStrip {
-			cursor = lipgloss.NewStyle().Foreground(accent).Render("▸ ")
-		}
+		cursor := cursorAt(len(prs) + idx)
 		state := m.sessionState(s.ID)
 		line := cursor + stateIcon[state] + " " + s.Name
 		if _, running, _ := strings.Cut(m.status[s.ID], " "); state == "background" && running != "" {
@@ -1023,22 +1274,46 @@ func (m model) sessionLines() []string {
 }
 
 func main() {
-	if err := loadConfig(); err != nil {
+	arg := ""
+	if len(os.Args) > 1 {
+		arg = os.Args[1]
+	}
+	switch {
+	case arg == "hook" && len(os.Args) == 4:
+		runHook(os.Args[2], os.Args[3], os.Stdin)
+		return
+	case arg == "transcript" && len(os.Args) == 3:
+		if err := printTranscript(os.Args[2], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	err := loadConfig()
+	if arg == "setup" || (err != nil && arg == "check" && term.IsTerminal(int(os.Stdin.Fd()))) {
+		err = setup()
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "check" {
+	if arg != "" {
 		return
 	}
 	if selfPane == "" {
-		fmt.Fprintln(os.Stderr, "run it through ./board (needs tmux)")
+		fmt.Fprintln(os.Stderr, "run it through ./kta (needs tmux)")
 		os.Exit(1)
 	}
 	tmux("set-environment", "-g", "LINEAR_API_KEY", apiKey)
-	for _, d := range []string{statusDir, runDir} {
+	for _, d := range []string{statusDir, runDir, reviewsDir} {
 		os.MkdirAll(d, 0o700)
 	}
 	sessions, err := loadSessions()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	settings, err := loadSettings()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1049,7 +1324,10 @@ func main() {
 	ta := textarea.New()
 	ta.Placeholder = "what do you want in this session?"
 	ta.ShowLineNumbers = false
-	m := model{sessions: sessions, live: map[string]string{}, status: map[string]string{}, search: search, ta: ta, vp: viewport.New(0, 0), loading: true, paneFocused: true}
+	ask := textinput.New()
+	ask.Prompt = ""
+	m := model{sessions: sessions, settings: settings, live: map[string]string{}, status: map[string]string{}, search: search, ta: ta, vp: viewport.New(0, 0), loading: true, paneFocused: true,
+		reviews: map[string]*Review{}, busy: map[string]bool{}, generating: map[string]bool{}, sending: map[string]bool{}, ask: ask, rvp: viewport.New(0, 0)}
 	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

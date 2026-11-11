@@ -17,11 +17,10 @@ import (
 
 const dailyPrompt = `You write my daily stand-up notes. The input has my Claude Code work sessions grouped by day: for each session, the ticket it was about (when there is one), what I asked and Claude's last replies.
 
-Write the summary in Brazilian Portuguese. For each day, write its heading exactly as given in bold (like **hoje**) on its own line, followed by a bullet list. One bullet per card or subject, never one per task: merge everything done on the same card or subject that day into a single bullet. Keep each bullet dumb and short, at the level of these examples, saying what the work was about and not the details of what was done: "trabalhei no card que falava de importação de planilhas", "revisei um PR da tela de estoque", "investiguei um bug de permissão no catálogo". Describe the subject so anyone on the team understands it: never write ticket identifiers (like KAN-123), session names, people, file paths, ids, URLs, keys or commit hashes. Leave out sessions where nothing real happened, like tests and quick questions. Reply with only the headings and bullets.`
+Write the summary in %s, even when the sessions are in another language. For each day, write its heading exactly as given in bold (like **%s**) on its own line, followed by a bullet list. One bullet per card or subject, never one per task: merge everything done on the same card or subject that day into a single bullet. Keep each bullet dumb and short, at the level of these examples, saying what the work was about and not the details of what was done: %s. Describe the subject so anyone on the team understands it: never write ticket identifiers (like KAN-123), session names, people, file paths, ids, URLs, keys or commit hashes. Leave out sessions where nothing real happened, like tests and quick questions. Reply with only the headings and bullets.`
 
 var (
 	dailyDir     = filepath.Join(confDir, "daily")
-	weekdays     = []string{"domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"}
 	ticketHeader = regexp.MustCompile(`(?m)^# Linear ticket \S+: (.+)$`)
 	secrets      = regexp.MustCompile(`\b(lin_api|sk-ant|ghp|gho|github_pat|xox[abp])[-_A-Za-z0-9]{8,}`)
 )
@@ -40,19 +39,19 @@ func dailySince(now time.Time) time.Time {
 	return d
 }
 
-func dailyCmd(force bool) tea.Cmd {
+func dailyCmd(force bool, lang language) tea.Cmd {
 	return func() tea.Msg {
 		now := time.Now()
-		file := filepath.Join(dailyDir, now.Format("2006-01-02")+".md")
+		file := filepath.Join(dailyDir, now.Format("2006-01-02")+"."+lang.code+".md")
 		if st, err := os.Stat(file); err == nil && !force {
 			b, err := os.ReadFile(file)
 			return dailyMsg{string(b), st.ModTime(), err}
 		}
-		notes := dailyNotes(dailySince(now), now)
+		notes := dailyNotes(dailySince(now), now, lang)
 		text := "_no Claude sessions since " + dailySince(now).Format("Mon 02/01") + "_"
 		if notes != "" {
 			var err error
-			if text, err = summarize(notes); err != nil {
+			if text, err = summarize(notes, lang); err != nil {
 				return dailyMsg{err: err}
 			}
 		}
@@ -63,8 +62,8 @@ func dailyCmd(force bool) tea.Cmd {
 	}
 }
 
-func summarize(notes string) (string, error) {
-	cmd := exec.Command("claude", "-p", "--model", "haiku", "--no-session-persistence", "--setting-sources", "project", "--strict-mcp-config", "--tools", "", "--system-prompt", dailyPrompt)
+func summarize(notes string, lang language) (string, error) {
+	cmd := exec.Command("claude", "-p", "--model", "haiku", "--no-session-persistence", "--setting-sources", "project", "--strict-mcp-config", "--tools", "", "--system-prompt", fmt.Sprintf(dailyPrompt, lang.prompt, lang.today, lang.examples))
 	cmd.Dir = confDir
 	cmd.Stdin = strings.NewReader(notes)
 	for _, e := range os.Environ() {
@@ -82,7 +81,7 @@ func summarize(notes string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func dailyNotes(since, now time.Time) string {
+func dailyNotes(since, now time.Time, lang language) string {
 	files, _ := filepath.Glob(filepath.Join(claudeSessionsDir, "*.jsonl"))
 	days := map[string][]string{}
 	for _, f := range files {
@@ -100,9 +99,9 @@ func dailyNotes(since, now time.Time) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, day := range keys {
-		label := "hoje"
+		label := lang.today
 		if d, _ := time.ParseInLocation("2006-01-02", day, now.Location()); day != now.Format("2006-01-02") {
-			label = weekdays[d.Weekday()] + " (" + d.Format("02/01") + ")"
+			label = lang.weekdays[d.Weekday()] + " (" + d.Format("02/01") + ")"
 		}
 		fmt.Fprintf(&b, "# %s\n\n%s\n", label, strings.Join(days[day], "\n"))
 	}

@@ -1,27 +1,32 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 const maxPromptBytes = 120_000
 
 var (
 	home, _      = os.UserHomeDir()
-	appDir       = func() string { exe, _ := os.Executable(); return filepath.Dir(exe) }()
-	envFile      = filepath.Join(appDir, ".env")
-	notifyScript = filepath.Join(appDir, "notify.sh")
-	confDir      = filepath.Join(home, ".config/linear-board")
+	selfExe, _   = os.Executable()
+	confDir      = filepath.Join(home, ".config/kta")
+	envFile      = filepath.Join(confDir, "env")
 	sessionsFile = filepath.Join(confDir, "sessions.json")
+	prURL        = regexp.MustCompile(`github\.com/([^/]+)/([^/]+)/pull/(\d+)`)
 	statusDir    = filepath.Join(confDir, "status")
 	runDir       = filepath.Join(confDir, "run")
 	selfPane     = os.Getenv("TMUX_PANE")
@@ -29,27 +34,111 @@ var (
 	workDir, claudeSessionsDir string
 )
 
+func readEnv() map[string]string {
+	env := map[string]string{}
+	b, _ := os.ReadFile(envFile)
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(strings.TrimPrefix(strings.TrimSpace(line), "export "), "=")
+		if k = strings.TrimSpace(k); ok && !strings.HasPrefix(k, "#") {
+			env[k] = strings.Trim(strings.TrimSpace(v), `"'`)
+		}
+	}
+	return env
+}
+
 func loadConfig() error {
-	if b, err := os.ReadFile(envFile); err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
-			k, v, ok := strings.Cut(strings.TrimPrefix(strings.TrimSpace(line), "export "), "=")
-			if k = strings.TrimSpace(k); ok && !strings.HasPrefix(k, "#") && os.Getenv(k) == "" {
-				os.Setenv(k, strings.Trim(strings.TrimSpace(v), `"'`))
-			}
+	for k, v := range readEnv() {
+		if v != "" {
+			os.Setenv(k, v)
 		}
 	}
 	apiKey, workDir = os.Getenv("LINEAR_API_KEY"), os.Getenv("WORKSPACE_DIR")
 	if apiKey == "" || workDir == "" {
-		return fmt.Errorf("set LINEAR_API_KEY and WORKSPACE_DIR in %s (cp .env.example .env)", envFile)
+		return fmt.Errorf("Linear key or workspace folder missing · run ./kta setup")
 	}
-	if rest, ok := strings.CutPrefix(workDir, "~/"); ok {
-		workDir = filepath.Join(home, rest)
-	}
-	if st, err := os.Stat(workDir); err != nil || !st.IsDir() {
-		return fmt.Errorf("WORKSPACE_DIR %s is not a folder", workDir)
+	workDir = expandHome(workDir)
+	if !isDir(workDir) {
+		return fmt.Errorf("WORKSPACE_DIR %s is not a folder · run ./kta setup", workDir)
 	}
 	claudeSessionsDir = filepath.Join(home, ".claude/projects", regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(workDir, "-"))
 	return nil
+}
+
+func expandHome(path string) string {
+	if rest, ok := strings.CutPrefix(path, "~/"); ok {
+		return filepath.Join(home, rest)
+	}
+	return path
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+
+func setup() error {
+	env := readEnv()
+	in := bufio.NewReader(os.Stdin)
+	fmt.Print("\nkta setup\n\n1. Your Linear API key\n   Create one in Linear: Settings → Account → Security & access → Personal API keys.\n")
+	for {
+		prompt := "   Paste it here (it won't show): "
+		if env["LINEAR_API_KEY"] != "" {
+			prompt = "   Paste a new one, or press enter to keep the current key: "
+		}
+		fmt.Print(prompt)
+		b, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return err
+		}
+		if s := strings.TrimSpace(string(b)); s != "" {
+			env["LINEAR_API_KEY"] = s
+		}
+		apiKey = env["LINEAR_API_KEY"]
+		name, err := viewerName()
+		if err == nil {
+			fmt.Printf("   ✓ connected as %s\n", name)
+			break
+		}
+		fmt.Printf("   ✗ Linear didn't accept it (%v)\n", err)
+		env["LINEAR_API_KEY"] = ""
+	}
+	def := env["WORKSPACE_DIR"]
+	if def == "" {
+		def, _ = os.Getwd()
+	}
+	fmt.Print("\n2. The folder where Claude sessions start, usually the repo or workspace you work in\n")
+	var dir string
+	for {
+		fmt.Printf("   Folder [%s]: ", def)
+		line, err := in.ReadString('\n')
+		if dir = strings.TrimSpace(line); dir == "" {
+			dir = def
+		}
+		if isDir(expandHome(dir)) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%s is not a folder", dir)
+		}
+		fmt.Printf("   ✗ %s is not a folder\n", dir)
+	}
+	env["WORKSPACE_DIR"] = dir
+	var b strings.Builder
+	for _, k := range slices.Sorted(maps.Keys(env)) {
+		fmt.Fprintf(&b, "%s=%s\n", k, env[k])
+	}
+	if err := os.MkdirAll(confDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(envFile, []byte(b.String()), 0o600); err != nil {
+		return err
+	}
+	os.Chmod(envFile, 0o600)
+	fmt.Printf("\n   Saved to %s. Run ./kta setup to change it.\n\n", envFile)
+	os.Setenv("LINEAR_API_KEY", env["LINEAR_API_KEY"])
+	os.Setenv("WORKSPACE_DIR", dir)
+	return loadConfig()
 }
 
 type Session struct {
@@ -70,24 +159,60 @@ func loadSessions() (map[string][]Session, error) {
 	return m, json.Unmarshal(b, &m)
 }
 
-func saveSessions(m map[string][]Session) error {
-	b, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(sessionsFile+".tmp", b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(sessionsFile+".tmp", sessionsFile)
-}
-
 func mutateSessions(change func(map[string][]Session)) (map[string][]Session, error) {
 	m, err := loadSessions()
 	if err != nil {
 		return nil, err
 	}
 	change(m)
-	return m, saveSessions(m)
+	return m, writeJSON(sessionsFile, m)
+}
+
+func writeJSON(file string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(file+".tmp", b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(file+".tmp", file)
+}
+
+func prTag(url string) string {
+	m := prURL.FindStringSubmatch(url)
+	if m == nil {
+		return "PR"
+	}
+	word := m[2]
+	if i := strings.LastIndex(word, "-"); i >= 0 && i < len(word)-1 {
+		word = word[i+1:]
+	}
+	return strings.ToUpper(word[:1]) + "#" + m[3]
+}
+
+func prLabel(url string) string {
+	if m := prURL.FindStringSubmatch(url); m != nil {
+		return m[2] + " #" + m[3]
+	}
+	return url
+}
+
+func canonicalPR(url string) string {
+	if m := prURL.FindStringSubmatch(url); m != nil {
+		return "https://github.com/" + m[1] + "/" + m[2] + "/pull/" + m[3]
+	}
+	return url
+}
+
+func issuePRs(i Issue) []string {
+	var out []string
+	for _, a := range i.Attachments.Nodes {
+		if prURL.MatchString(a.URL) {
+			out = append(out, canonicalPR(a.URL))
+		}
+	}
+	return out
 }
 
 func newUUID() string {
@@ -107,7 +232,7 @@ func tmux(args ...string) (string, error) {
 }
 
 func livePanes() (live map[string]string, untitled []string, err error) {
-	out, err := tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@lb_session}\t#{@lb_title}")
+	out, err := tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@kta_session}\t#{@kta_title}")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -126,7 +251,7 @@ func livePanes() (live map[string]string, untitled []string, err error) {
 }
 
 func setTitle(pane, title string) error {
-	_, err := tmux("set-option", "-p", "-t", pane, "@lb_title", title)
+	_, err := tmux("set-option", "-p", "-t", pane, "@kta_title", title)
 	return err
 }
 
@@ -152,7 +277,7 @@ func hookSettings(id, title string) string {
 	}
 	set := func(state string) string { return "printf " + state + " > " + file }
 	notify := func(event string) string {
-		return "sh " + shq(notifyScript) + " " + shq(title) + " " + event + "; exit 0"
+		return shq(selfExe) + " hook " + shq(title) + " " + event + "; exit 0"
 	}
 	b, _ := json.Marshal(map[string]any{"hooks": map[string]any{
 		"SessionStart":     hook(set("waiting")),
@@ -178,7 +303,7 @@ func launch(id, title string, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err = tmux("set-option", "-p", "-t", pane, "@lb_session", id); err != nil {
+	if _, err = tmux("set-option", "-p", "-t", pane, "@kta_session", id); err != nil {
 		return pane, err
 	}
 	return pane, setTitle(pane, title)
@@ -269,7 +394,7 @@ func previousSessions(list []Session, live map[string]string) []string {
 	return append([]string{
 		"## Previous sessions on this ticket",
 		"Other Claude sessions already worked on this ticket. If you need what was done or decided there, read only the replies (the full file is large):",
-		"`jq -r 'select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' <file>`",
+		"`" + shq(selfExe) + " transcript <file>`",
 	}, append(lines, "")...)
 }
 

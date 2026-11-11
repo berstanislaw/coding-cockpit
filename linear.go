@@ -7,23 +7,27 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 )
 
-const boardQuery = `query($after: String) {
-  viewer {
-    assignedIssues(first: 100, after: $after, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        identifier title url priority updatedAt
-        state { name type position color }
-        team { key }
-        labels(first: 10) { nodes { name color } }
-      }
+const boardQuery = `query($after: String, $filter: IssueFilter) {
+  issues(first: 100, after: $after, filter: $filter) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      identifier title url priority updatedAt
+      state { name type position color }
+      team { key }
+      labels(first: 10) { nodes { name color } }
+      attachments { nodes { url } }
     }
   }
+}`
+
+const statesQuery = `query($keys: [String!]) {
+  teams(filter: { key: { in: $keys } }) { nodes { states { nodes { name type position color } } } }
 }`
 
 const issueQuery = `query($id: String!) {
@@ -32,7 +36,14 @@ const issueQuery = `query($id: String!) {
     state { name type position color }
     team { key }
     labels(first: 10) { nodes { name color } }
+    attachments { nodes { url } }
     comments(first: 100) { nodes { body createdAt user { name } } }
+  }
+}`
+
+const doneQuery = `query($ids: [ID!]) {
+  issues(first: 100, filter: { id: { in: $ids }, state: { type: { in: ["completed", "canceled", "duplicate"] } } }) {
+    nodes { identifier }
   }
 }`
 
@@ -61,7 +72,10 @@ type Issue struct {
 	Labels      struct {
 		Nodes []struct{ Name, Color string }
 	}
-	Comments struct{ Nodes []Comment }
+	Comments    struct{ Nodes []Comment }
+	Attachments struct {
+		Nodes []struct{ URL string }
+	}
 }
 
 var (
@@ -109,31 +123,73 @@ func linear(query string, vars map[string]any, out any) error {
 	return json.Unmarshal(r.Data, out)
 }
 
-func fetchBoard() ([]Issue, error) {
+func fetchBoard(sources []string) ([]Issue, error) {
+	me := map[string]any{"isMe": map[string]any{"eq": true}}
+	var who []map[string]any
+	for _, src := range ticketSources {
+		if slices.Contains(sources, src.key) {
+			who = append(who, map[string]any{src.field: me})
+		}
+	}
+	filter := map[string]any{"or": who, "state": map[string]any{"type": map[string]any{"nin": []string{"completed", "canceled", "duplicate"}}}}
 	var issues []Issue
 	var after *string
 	for {
 		var d struct {
-			Viewer struct {
-				AssignedIssues struct {
-					PageInfo struct {
-						HasNextPage bool
-						EndCursor   string
-					}
-					Nodes []Issue
+			Issues struct {
+				PageInfo struct {
+					HasNextPage bool
+					EndCursor   string
 				}
+				Nodes []Issue
 			}
 		}
-		if err := linear(boardQuery, map[string]any{"after": after}, &d); err != nil {
+		if err := linear(boardQuery, map[string]any{"after": after, "filter": filter}, &d); err != nil {
 			return nil, err
 		}
-		page := d.Viewer.AssignedIssues
+		page := d.Issues
 		issues = append(issues, page.Nodes...)
 		if !page.PageInfo.HasNextPage {
 			return issues, nil
 		}
 		after = &page.PageInfo.EndCursor
 	}
+}
+
+func fetchDone(keys []string) ([]string, error) {
+	var d struct {
+		Issues struct{ Nodes []struct{ Identifier string } }
+	}
+	if err := linear(doneQuery, map[string]any{"ids": keys}, &d); err != nil {
+		return nil, err
+	}
+	out := make([]string, len(d.Issues.Nodes))
+	for i, n := range d.Issues.Nodes {
+		out[i] = n.Identifier
+	}
+	return out, nil
+}
+
+func viewerName() (string, error) {
+	var d struct{ Viewer struct{ Name string } }
+	err := linear(`{ viewer { name } }`, nil, &d)
+	return d.Viewer.Name, err
+}
+
+func fetchStates(teams []string) ([]State, error) {
+	var d struct {
+		Teams struct {
+			Nodes []struct{ States struct{ Nodes []State } }
+		}
+	}
+	if err := linear(statesQuery, map[string]any{"keys": teams}, &d); err != nil {
+		return nil, err
+	}
+	var out []State
+	for _, t := range d.Teams.Nodes {
+		out = append(out, t.States.Nodes...)
+	}
+	return out, nil
 }
 
 func fetchIssue(key string) (Issue, error) {
