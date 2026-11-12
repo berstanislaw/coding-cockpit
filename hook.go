@@ -48,7 +48,18 @@ func runHook(title, event string, r io.Reader) {
 	if s, _ := loadSettings(); s.NotificationsOff || paneInView() {
 		return
 	}
-	notify(title, body)
+	notify(notifyTitle(title), body)
+}
+
+func notifyTitle(title string) string {
+	key, _, found := strings.Cut(title, " · ")
+	if !found {
+		return title
+	}
+	if keys := strings.Split(key, "+"); len(keys) > 1 {
+		return fmt.Sprintf("%s +%d", keys[0], len(keys)-1)
+	}
+	return key
 }
 
 func running(in hookInput) string {

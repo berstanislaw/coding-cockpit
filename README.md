@@ -104,6 +104,10 @@ Each session shows a status:
 
 Cards show the same dots, with a number when more than one session is in the same state (`●2`).
 
+### Several tickets at once
+
+When a few tickets are really one piece of work, mark them with `g` (they get a double purple border and a `✓`), then press `n`. That starts one session with all of them in the prompt, told to handle them together. The session belongs to every ticket in the group. Each group gets its own color, picked at random among the ones farthest from the colors already in use. Cards of a group that share a column sit together, joined by a bar in that color on their left; each card also shows a colored `◆`, the ticket panel says who else is in it (`◆ with KAN-1118 KAN-1119`), and when the cursor is on one of them, the others light up. `esc` clears the marks. `z` folds a group into a single card (`◆ 3 cards`) and `z` again unfolds it. When the tickets don't fit, their numbers scroll by, and the line below cycles through each ticket's title every few seconds. `Z` folds or unfolds every group at once, and the board remembers what's folded. On a folded card, `n` starts a session for the whole group and `p` opens the PRs of all of its tickets. Removing the session removes it from the whole group, and a ticket that's finished leaves the group without taking the session from the others.
+
 ### PRs on cards
 
 Cards show the pull requests that belong to them, in purple, tagged by repo: `A#1782` for the API, `W#2210` for the web. The letter is the first one of the repo name's last word, so other repos get their own letter (`D#347` for docs).
@@ -112,7 +116,7 @@ The PRs come from Linear: its GitHub integration attaches them to the ticket, an
 
 `p` opens all of a ticket's PRs in the browser. In the ticket panel they're also listed above the sessions, and `enter` on one opens just that PR.
 
-When a session finishes or needs your attention, you get a desktop notification, unless you're already looking at that session or turned them off in settings.
+When a session finishes or needs your attention, you get a desktop notification titled with the ticket (`KAN-1118`, or `KAN-1115 +2` for a group), unless you're already looking at that session or turned them off in settings.
 
 ### Tabs
 
@@ -179,7 +183,9 @@ On the kanban:
 | --- | --- |
 | arrows or `hjkl` | move around |
 | `enter` | open the ticket |
-| `n` | new session for the ticket |
+| `n` | new session for the ticket, or one session for all the marked tickets |
+| `g` | mark or unmark the ticket, to work on several together |
+| `z` / `Z` | fold or unfold the group under the cursor / every group |
 | `p` | open the ticket's PRs in the browser |
 | `o` | open the ticket in the browser |
 | `/` | search |

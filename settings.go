@@ -22,6 +22,7 @@ type Settings struct {
 	NotificationsOff bool     `json:"notificationsOff,omitempty"`
 	HiddenTabs       []string `json:"hiddenTabs,omitempty"`
 	ReviewLabels     []string `json:"reviewLabels,omitempty"`
+	CollapsedGroups  []string `json:"collapsedGroups,omitempty"`
 }
 
 type language struct {

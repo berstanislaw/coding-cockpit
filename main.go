@@ -3,6 +3,9 @@ package main
 import (
 	"cmp"
 	"fmt"
+	"hash/fnv"
+	"math"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"runtime"
@@ -64,6 +67,9 @@ var (
 		"stopped":    dim,
 	}
 	prStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a7bb8"))
+	markColor  = lipgloss.Color("#d2a8ff")
+	markStyle  = lipgloss.NewStyle().Foreground(markColor)
+	markHue    = 270
 	stateGlyph = map[string]string{"working": "●", "waiting": "◉", "background": "◐", "stopped": "○"}
 	stateIcon  = map[string]string{
 		"working":    stateStyle["working"].Render(stateGlyph["working"]),
@@ -94,12 +100,14 @@ type (
 		err          error
 	}
 	launchedMsg struct {
-		key, id, pane string
-		rec           *Session
-		err           error
+		keys     []string
+		id, pane string
+		rec      *Session
+		err      error
 	}
 	doneMsg      []string
 	tickMsg      struct{}
+	animMsg      struct{}
 	boardTickMsg struct{}
 )
 
@@ -149,6 +157,11 @@ type model struct {
 	prsLoading  bool
 	rvp         viewport.Model
 	rvpKey      string
+	marked      []string
+	newGroup    []string
+	collapsed   map[string]cardGroup
+	frame       int
+	animOn      bool
 }
 
 func loadBoardCmd(sources []string) tea.Cmd {
@@ -204,14 +217,194 @@ func titleFor(key, name string) string {
 }
 
 func (m model) titleOf(id string) string {
-	for key, list := range m.sessions {
-		for _, s := range list {
-			if s.ID == id {
-				return titleFor(key, s.Name)
-			}
+	keys := keysOf(m.sessions, id)
+	if len(keys) == 0 {
+		return ""
+	}
+	for _, s := range m.sessions[keys[0]] {
+		if s.ID == id {
+			return titleFor(strings.Join(keys, "+"), s.Name)
 		}
 	}
 	return ""
+}
+
+type cardGroup struct {
+	id      string
+	members []string
+	color   lipgloss.Color
+	issues  []Issue
+}
+
+func (g cardGroup) key() string {
+	return g.id
+}
+
+func (m model) allGroups() []string {
+	var keys []string
+	for key := range m.sessions {
+		for _, g := range m.groupsOf(key) {
+			if !slices.Contains(keys, g.key()) {
+				keys = append(keys, g.key())
+			}
+		}
+	}
+	return keys
+}
+
+func (m model) foldKey(key string) (model, tea.Cmd) {
+	i := m.selectedIssue()
+	next := m.settings
+	switch {
+	case key == "Z" && len(next.CollapsedGroups) > 0:
+		next.CollapsedGroups = nil
+	case key == "Z":
+		next.CollapsedGroups = m.allGroups()
+	case i == nil:
+		return m, nil
+	case m.collapsed[i.Identifier].members != nil:
+		next.CollapsedGroups = slices.DeleteFunc(slices.Clone(next.CollapsedGroups), func(k string) bool { return k == m.collapsed[i.Identifier].key() })
+	default:
+		gs := m.groupsOf(i.Identifier)
+		if len(gs) == 0 {
+			return m, nil
+		}
+		next.CollapsedGroups = toggle(next.CollapsedGroups, gs[0].key())
+	}
+	return m.applySettings(next)
+}
+
+func (m *model) collapse(items []Issue) []Issue {
+	var kept []Issue
+	hidden := map[string]bool{}
+	for _, i := range items {
+		if hidden[i.Identifier] {
+			continue
+		}
+		kept = append(kept, i)
+		for _, g := range m.groupsOf(i.Identifier) {
+			if !slices.Contains(m.settings.CollapsedGroups, g.key()) {
+				continue
+			}
+			g.issues = []Issue{i}
+			for _, j := range items {
+				if j.Identifier != i.Identifier && !hidden[j.Identifier] && slices.Contains(g.members, j.Identifier) {
+					hidden[j.Identifier] = true
+					g.issues = append(g.issues, j)
+				}
+			}
+			if len(g.issues) > 1 {
+				m.collapsed[i.Identifier] = g
+				break
+			}
+		}
+	}
+	return kept
+}
+
+func (m model) groupsOf(key string) []cardGroup {
+	var groups []cardGroup
+	for _, s := range m.sessions[key] {
+		keys := keysOf(m.sessions, s.ID)
+		if len(keys) < 2 || slices.ContainsFunc(groups, func(g cardGroup) bool { return slices.Equal(g.members, keys) }) {
+			continue
+		}
+		hue := 0
+		if s.Hue != nil {
+			hue = *s.Hue
+		} else {
+			h := fnv.New32a()
+			h.Write([]byte(strings.Join(keys, "+")))
+			hue = int(h.Sum32() % 360)
+		}
+		groups = append(groups, cardGroup{id: s.ID, members: keys, color: hueColor(float64(hue))})
+	}
+	return groups
+}
+
+func (m model) usedHues() []int {
+	hues := []int{markHue}
+	for _, list := range m.sessions {
+		for _, s := range list {
+			if s.Hue != nil && !slices.Contains(hues, *s.Hue) {
+				hues = append(hues, *s.Hue)
+			}
+		}
+	}
+	return hues
+}
+
+func pickHue(used []int) int {
+	best, bestDist := []int{}, -1
+	for h := 0; h < 360; h += 15 {
+		dist := 360
+		for _, u := range used {
+			d := (h - u + 360) % 360
+			dist = min(dist, d, 360-d)
+		}
+		switch {
+		case dist > bestDist:
+			best, bestDist = []int{h}, dist
+		case dist == bestDist:
+			best = append(best, h)
+		}
+	}
+	return best[rand.IntN(len(best))]
+}
+
+func hueColor(h float64) lipgloss.Color {
+	s, l := 0.7, 0.68
+	c := (1 - math.Abs(2*l-1)) * s
+	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	var r, g, b float64
+	switch {
+	case h < 60:
+		r, g = c, x
+	case h < 120:
+		r, g = x, c
+	case h < 180:
+		g, b = c, x
+	case h < 240:
+		g, b = x, c
+	case h < 300:
+		r, b = x, c
+	default:
+		r, b = c, x
+	}
+	o := l - c/2
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", int((r+o)*255), int((g+o)*255), int((b+o)*255)))
+}
+
+func (m model) clusterGroups(items []Issue) []Issue {
+	out := make([]Issue, 0, len(items))
+	placed := map[string]bool{}
+	for _, i := range items {
+		if placed[i.Identifier] {
+			continue
+		}
+		out, placed[i.Identifier] = append(out, i), true
+		for _, g := range m.groupsOf(i.Identifier) {
+			for _, j := range items {
+				if !placed[j.Identifier] && slices.Contains(g.members, j.Identifier) {
+					out, placed[j.Identifier] = append(out, j), true
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (m model) groupKeys() []string {
+	if m.tab != tabKanban {
+		return nil
+	}
+	if len(m.newGroup) > 1 {
+		return m.newGroup
+	}
+	if len(m.marked) < 2 {
+		return nil
+	}
+	return slices.Sorted(slices.Values(m.marked))
 }
 
 func openURL(url string) {
@@ -295,6 +488,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+	case animMsg:
+		m.frame++
+		if m.animating() {
+			return m, animTick()
+		}
+		m.animOn = false
+		return m, nil
 	case tickMsg:
 		return m, tea.Batch(refreshStateCmd(), tick())
 	case launchedMsg:
@@ -303,7 +503,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if msg.rec != nil {
-			sessions, err := mutateSessions(func(s map[string][]Session) { s[msg.key] = append(s[msg.key], *msg.rec) })
+			sessions, err := mutateSessions(func(s map[string][]Session) {
+				for _, key := range msg.keys {
+					s[key] = append(s[key], *msg.rec)
+				}
+			})
 			if err != nil {
 				m.err = err
 				break
@@ -342,7 +546,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ta.SetWidth(m.inner())
 		m.ta.SetHeight(5)
 	}
+	if !m.animOn && m.animating() {
+		m.animOn = true
+		cmd = tea.Batch(cmd, animTick())
+	}
 	return m, cmd
+}
+
+func animTick() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return animMsg{} })
+}
+
+func (m model) animating() bool {
+	return m.tab == tabKanban && len(m.collapsed) > 0
+}
+
+func marquee(s string, width, frame int) string {
+	if ansi.StringWidth(s) <= width {
+		return s
+	}
+	loop := []rune(s + "   ·   ")
+	start := frame % len(loop)
+	return ansi.Truncate(string(append(loop[start:], loop[:start]...)), width, "")
 }
 
 func (m *model) fitDaily() {
@@ -466,7 +691,7 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 	case m.focus == focusNew:
 		switch key {
 		case "esc":
-			m.focus = focusStrip
+			m.focus, m.newGroup = focusStrip, nil
 			return m, nil
 		case "ctrl+s", "alt+enter":
 			return m.submit()
@@ -504,16 +729,30 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 	case "enter":
 		return m.openTicket(false)
 	case "n":
+		m.newGroup = nil
+		if i := m.selectedIssue(); i != nil && len(m.collapsed[i.Identifier].members) > 1 {
+			m.newGroup = m.collapsed[i.Identifier].members
+		}
 		return m.openTicket(true)
+	case "z", "Z":
+		return m.foldKey(key)
+	case "g", "G":
+		if i := m.selectedIssue(); i != nil {
+			m.marked = toggle(m.marked, i.Identifier)
+		}
 	case "p":
 		if i := m.selectedIssue(); i != nil {
-			m.openPRs(i.Identifier)
+			m.openPRs(m.cardKeys(*i)...)
 		}
 	case "tab", "alt+down":
 		if m.ticket != nil {
 			m.focus = focusStrip
 		}
 	case "esc":
+		if len(m.marked) > 0 {
+			m.marked = nil
+			break
+		}
 		m.closeTicket()
 	case "/":
 		m.searching = true
@@ -585,7 +824,7 @@ func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 			break
 		}
 		if !live {
-			return m, resumeCmd(s.ID, titleFor(key0, s.Name))
+			return m, resumeCmd(s.ID, m.titleOf(s.ID))
 		}
 		if err := showRight(pane); err != nil {
 			m.err = err
@@ -676,10 +915,20 @@ func (m model) prsFor(key string) []string {
 	return out
 }
 
-func (m *model) openPRs(key string) {
-	prs := m.prsFor(key)
+func (m model) cardKeys(i Issue) []string {
+	if cg := m.collapsed[i.Identifier]; len(cg.issues) > 1 {
+		return cg.members
+	}
+	return []string{i.Identifier}
+}
+
+func (m *model) openPRs(keys ...string) {
+	var prs []string
+	for _, key := range keys {
+		prs = append(prs, m.prsFor(key)...)
+	}
 	if len(prs) == 0 {
-		m.err = fmt.Errorf("%s has no PRs in Linear", key)
+		m.err = fmt.Errorf("%s has no PRs in Linear", strings.Join(keys, ", "))
 		return
 	}
 	for _, url := range prs {
@@ -693,6 +942,37 @@ func (m model) submit() (model, tea.Cmd) {
 	rec := Session{ID: newUUID(), Name: sessionName(request, len(list)+1), CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	title := titleFor(key, rec.Name)
 	m.focus = focusStrip
+	if keys := m.groupKeys(); keys != nil {
+		var list []Session
+		for _, k := range keys {
+			for _, s := range m.sessions[k] {
+				if !slices.ContainsFunc(list, func(x Session) bool { return x.ID == s.ID }) {
+					list = append(list, s)
+				}
+			}
+		}
+		previous := previousSessions(list, m.live)
+		rec.Name = sessionName(request, len(list)+1)
+		hue := pickHue(m.usedHues())
+		rec.Hue = &hue
+		title := titleFor(strings.Join(keys, "+"), rec.Name)
+		if m.newGroup == nil {
+			m.marked = nil
+		}
+		m.newGroup = nil
+		return m, func() tea.Msg {
+			issues := make([]Issue, len(keys))
+			for i, k := range keys {
+				issue, err := fetchIssue(k)
+				if err != nil {
+					return launchedMsg{err: err}
+				}
+				issues[i] = issue
+			}
+			pane, err := launch(rec.ID, title, "--session-id", rec.ID, "-n", title, buildPrompt(issues, request, previous))
+			return launchedMsg{keys: keys, id: rec.ID, pane: pane, rec: &rec, err: err}
+		}
+	}
 	if key == freeKey {
 		return m, func() tea.Msg {
 			args := []string{"--session-id", rec.ID, "-n", title}
@@ -700,7 +980,7 @@ func (m model) submit() (model, tea.Cmd) {
 				args = append(args, request)
 			}
 			pane, err := launch(rec.ID, title, args...)
-			return launchedMsg{key: key, id: rec.ID, pane: pane, rec: &rec, err: err}
+			return launchedMsg{keys: []string{key}, id: rec.ID, pane: pane, rec: &rec, err: err}
 		}
 	}
 	previous := previousSessions(list, m.live)
@@ -708,7 +988,7 @@ func (m model) submit() (model, tea.Cmd) {
 		p := *m.openPR
 		return m, func() tea.Msg {
 			pane, err := launch(rec.ID, title, "--session-id", rec.ID, "-n", title, prPrompt(p, request, previous))
-			return launchedMsg{key: key, id: rec.ID, pane: pane, rec: &rec, err: err}
+			return launchedMsg{keys: []string{key}, id: rec.ID, pane: pane, rec: &rec, err: err}
 		}
 	}
 	return m, func() tea.Msg {
@@ -716,23 +996,17 @@ func (m model) submit() (model, tea.Cmd) {
 		if err != nil {
 			return launchedMsg{err: err}
 		}
-		pane, err := launch(rec.ID, title, "--session-id", rec.ID, "-n", title, buildPrompt(issue, request, previous))
-		return launchedMsg{key: key, id: rec.ID, pane: pane, rec: &rec, err: err}
+		pane, err := launch(rec.ID, title, "--session-id", rec.ID, "-n", title, buildPrompt([]Issue{issue}, request, previous))
+		return launchedMsg{keys: []string{key}, id: rec.ID, pane: pane, rec: &rec, err: err}
 	}
 }
 
 func (m *model) removeSession(key, id string) {
 	sessions, err := mutateSessions(func(s map[string][]Session) {
-		var kept []Session
-		for _, x := range s[key] {
-			if x.ID != id {
-				kept = append(kept, x)
+		for k := range s {
+			if s[k] = slices.DeleteFunc(s[k], func(x Session) bool { return x.ID == id }); len(s[k]) == 0 {
+				delete(s, k)
 			}
-		}
-		if len(kept) == 0 {
-			delete(s, key)
-		} else {
-			s[key] = kept
 		}
 	})
 	if err != nil {
@@ -765,7 +1039,9 @@ func (m *model) forget(keys []string) {
 		return
 	}
 	for _, id := range ids {
-		os.Remove(statusDir + "/" + id)
+		if len(keysOf(sessions, id)) == 0 {
+			os.Remove(statusDir + "/" + id)
+		}
 	}
 	m.sessions = sessions
 	m.sel = max(0, min(m.sel, len(m.prsFor(m.listKey()))+len(sessions[m.listKey()])-1))
@@ -842,7 +1118,7 @@ func (m *model) buildColumns() {
 	}
 	q := strings.ToLower(m.search.Value())
 	index := map[string]int{}
-	m.cols = nil
+	m.cols, m.collapsed = nil, map[string]cardGroup{}
 	for _, i := range m.issues {
 		if q != "" && !strings.Contains(strings.ToLower(i.Identifier+" "+i.Title), q) {
 			continue
@@ -878,8 +1154,11 @@ func (m *model) buildColumns() {
 		})
 	}
 	for c := range m.cols {
+		m.cols[c].items = m.collapse(m.clusterGroups(m.cols[c].items))
+	}
+	for c := range m.cols {
 		for r, i := range m.cols[c].items {
-			if i.Identifier == selected {
+			if i.Identifier == selected || slices.ContainsFunc(m.collapsed[i.Identifier].issues, func(x Issue) bool { return x.Identifier == selected }) {
 				m.col, m.row = c, r
 			}
 		}
@@ -1053,7 +1332,15 @@ func (m model) keyHelp() []keyHelp {
 	case m.focus == focusStrip:
 		return []keyHelp{{"enter", "show / open PR", true}, {"n", "new session", true}, {"p", "open PRs", true}, {"↑↓", "select", false}, {"o", "open in browser", false}, stop, remove, {"pgup/pgdn", "scroll the ticket", false}, {"r", "reload the ticket", false}, {"alt+↑ / esc", "back to the kanban", false}, claude, tabs, quit}
 	}
-	keys := []keyHelp{{"enter", "open", true}, {"n", "new session", true}, {"/", "search", true}, {"←→↑↓", "move", false}, {"p", "open PRs", false}, {"o", "open in browser", false}, {"r", "refresh", false}}
+	marks := len(m.marked)
+	keys := []keyHelp{{"enter", "open", marks == 0}, {"n", "new session", marks == 0}, {"/", "search", marks == 0}, {"←→↑↓", "move", false}, {"g", "mark cards to work on together", false}, {"z / Z", "fold or unfold the group / all groups", false}, {"p", "open PRs", false}, {"o", "open in browser", false}, {"r", "refresh", false}}
+	if marks > 0 {
+		group := []keyHelp{{"g", "mark / unmark", true}}
+		if marks > 1 {
+			group = append(group, keyHelp{"n", fmt.Sprintf("one session for the %d cards", marks), true})
+		}
+		keys = append(append(group, keyHelp{"esc", "clear the marks", true}), keys...)
+	}
 	if m.ticket != nil {
 		keys = append(keys, keyHelp{"alt+↓ / tab", "ticket panel", false}, keyHelp{"esc", "close the ticket", false}, claude)
 	}
@@ -1107,6 +1394,9 @@ func (m model) header() string {
 		} else {
 			header += dim.Render("/ search")
 		}
+		if n := len(m.marked); n > 0 {
+			header += markStyle.Render(fmt.Sprintf("  ✓ %d marked", n))
+		}
 		if first, fit, _ := m.colWindow(); fit < len(m.cols) {
 			header += dim.Render(fmt.Sprintf("  columns %d-%d of %d", first+1, first+fit, len(m.cols)))
 		}
@@ -1129,11 +1419,25 @@ func (m model) viewColumns(height int) string {
 		return dim.Render("no issues")
 	}
 	first, fit, cw := m.colWindow()
-	cardH := func(i Issue) int { return lipgloss.Height(m.card(i, cw, false)) }
+	cardH := func(i Issue) int { return lipgloss.Height(m.card(i, cw-1, false)) }
+	render := func(i Issue, cursor bool) string {
+		c := m.card(i, cw-1, cursor)
+		bar := " "
+		if cg := m.collapsed[i.Identifier]; cg.members != nil {
+			bar = lipgloss.NewStyle().Foreground(cg.color).Render("┃")
+		} else if gs := m.groupsOf(i.Identifier); len(gs) > 0 {
+			bar = lipgloss.NewStyle().Foreground(gs[0].color).Render("┃")
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, strings.TrimSuffix(strings.Repeat(bar+"\n", lipgloss.Height(c)), "\n"), c)
+	}
 	var blocks []string
 	for c := first; c < min(n, first+fit); c++ {
 		col := m.cols[c]
-		head := lipgloss.NewStyle().Foreground(lipgloss.Color(col.state.Color)).Render("●") + " " + bold.Render(col.state.Name) + dim.Render(fmt.Sprintf(" %d", len(col.items)))
+		count := len(col.items)
+		for _, i := range col.items {
+			count += max(0, len(m.collapsed[i.Identifier].issues)-1)
+		}
+		head := lipgloss.NewStyle().Foreground(lipgloss.Color(col.state.Color)).Render("●") + " " + bold.Render(col.state.Name) + dim.Render(fmt.Sprintf(" %d", count))
 		lines := []string{ansi.Truncate(head, cw, "…")}
 		offset := 0
 		if c == m.col {
@@ -1151,7 +1455,7 @@ func (m model) viewColumns(height int) string {
 			if used += cardH(col.items[r]); used > height-1 && r > offset {
 				break
 			}
-			lines = append(lines, m.card(col.items[r], cw, c == m.col && r == m.row))
+			lines = append(lines, render(col.items[r], c == m.col && r == m.row))
 		}
 		if c > first {
 			blocks = append(blocks, " ")
@@ -1163,12 +1467,27 @@ func (m model) viewColumns(height int) string {
 
 func (m model) card(i Issue, cw int, cursor bool) string {
 	inner := cw - 4
+	marked := slices.Contains(m.marked, i.Identifier)
 	meta := i.Identifier
+	if marked {
+		meta = markStyle.Render("✓ " + i.Identifier)
+	}
 	if p := int(i.Priority); p > 0 && p < len(priorities) {
 		meta += " " + prioStyle[p].Render(priorities[p])
 	}
 	if b := m.badge(i.Identifier); b != "" {
 		meta += " " + b
+	}
+	for _, g := range m.groupsOf(i.Identifier) {
+		meta += " " + lipgloss.NewStyle().Foreground(g.color).Render("◆")
+	}
+	var mate lipgloss.Color
+	if sel := m.selectedIssue(); sel != nil && sel.Identifier != i.Identifier {
+		for _, g := range m.groupsOf(sel.Identifier) {
+			if slices.Contains(g.members, i.Identifier) {
+				mate = g.color
+			}
+		}
 	}
 	body := clampLines(i.Title, inner, 2)
 	if prs := m.prsFor(i.Identifier); len(prs) > 0 {
@@ -1179,22 +1498,44 @@ func (m model) card(i Issue, cw int, cursor bool) string {
 		titleLines := min(2, len(strings.Split(ansi.Wordwrap(i.Title, inner, ""), "\n")))
 		body = clampLines(i.Title, inner, titleLines) + "\n" + ansi.Truncate(strings.Join(tags, " "), inner, "…")
 	}
+	if cg := m.collapsed[i.Identifier]; len(cg.issues) > 1 {
+		ids := make([]string, len(cg.issues))
+		for k, x := range cg.issues {
+			ids[k] = x.Identifier
+		}
+		meta = lipgloss.NewStyle().Foreground(cg.color).Bold(true).Render(fmt.Sprintf("◆ %d cards", len(cg.issues)))
+		if b := m.badge(ids...); b != "" {
+			meta += " " + b
+		}
+		shown := cg.issues[m.frame/12%len(cg.issues)]
+		body = marquee(strings.Join(ids, " · "), inner, m.frame) + "\n" + ansi.Truncate(lipgloss.NewStyle().Foreground(cg.color).Render(shown.Identifier)+" "+dim.Render(shown.Title), inner, "…")
+	}
 	style := cardStyle
 	switch {
 	case cursor && m.focus == focusBoard && m.paneFocused:
 		style = style.Border(lipgloss.ThickBorder()).BorderForeground(focusColor)
 	case m.ticket != nil && m.ticket.Identifier == i.Identifier:
 		style = style.BorderForeground(openColor)
+	case marked:
+		style = style.Border(lipgloss.DoubleBorder()).BorderForeground(markColor)
+	case mate != "":
+		style = style.BorderForeground(mate)
 	case cursor:
 		style = style.BorderForeground(lipgloss.Color("#8b919c"))
 	}
 	return style.Width(cw - 2).Render(ansi.Truncate(meta, inner, "…") + "\n" + body)
 }
 
-func (m model) badge(key string) string {
+func (m model) badge(keys ...string) string {
 	count := map[string]int{}
-	for _, s := range m.sessions[key] {
-		count[m.sessionState(s.ID)]++
+	seen := map[string]bool{}
+	for _, key := range keys {
+		for _, s := range m.sessions[key] {
+			if !seen[s.ID] {
+				seen[s.ID] = true
+				count[m.sessionState(s.ID)]++
+			}
+		}
 	}
 	var out []string
 	for _, st := range []string{"waiting", "working", "background", "stopped"} {
@@ -1236,6 +1577,9 @@ func (m model) stripTop() string {
 
 func (m model) sessionLines() []string {
 	if m.focus == focusNew {
+		if keys := m.groupKeys(); keys != nil {
+			return []string{bold.Render("New session for ") + markStyle.Render(strings.Join(keys, ", ")), m.ta.View()}
+		}
 		return []string{bold.Render("New session"), m.ta.View()}
 	}
 	w := m.inner()
@@ -1260,6 +1604,16 @@ func (m model) sessionLines() []string {
 		line := cursor + stateIcon[state] + " " + s.Name
 		if _, running, _ := strings.Cut(m.status[s.ID], " "); state == "background" && running != "" {
 			line += stateStyle[state].Render("  " + running + " running")
+		}
+		if keys := keysOf(m.sessions, s.ID); len(keys) > 1 {
+			others := slices.DeleteFunc(slices.Clone(keys), func(k string) bool { return k == m.listKey() })
+			color := lipgloss.Color("")
+			for _, g := range m.groupsOf(m.listKey()) {
+				if slices.Equal(g.members, keys) {
+					color = g.color
+				}
+			}
+			line += lipgloss.NewStyle().Foreground(color).Render("  ◆ with " + strings.Join(others, " "))
 		}
 		lines = append(lines, ansi.Truncate(line+dim.Render(fmt.Sprintf("  %.10s", s.CreatedAt)), w, "…"))
 	}

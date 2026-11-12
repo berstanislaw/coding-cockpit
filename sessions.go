@@ -145,6 +145,7 @@ type Session struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	CreatedAt string `json:"createdAt"`
+	Hue       *int   `json:"hue,omitempty"`
 }
 
 func loadSessions() (map[string][]Session, error) {
@@ -398,11 +399,33 @@ func previousSessions(list []Session, live map[string]string) []string {
 	}, append(lines, "")...)
 }
 
-func buildPrompt(i Issue, request string, previous []string) string {
+func buildPrompt(issues []Issue, request string, previous []string) string {
 	request = strings.TrimSpace(request)
-	if request == "" {
+	switch {
+	case request != "":
+	case len(issues) > 1:
+		request = "Read the tickets below and tell me how you want to proceed."
+	default:
 		request = "Read the ticket below and tell me how you want to proceed."
 	}
+	parts := append([]string{request, ""}, previous...)
+	if len(issues) > 1 {
+		parts = append(parts, fmt.Sprintf("These %d tickets are one piece of work: handle them together.", len(issues)), "")
+	}
+	for k, i := range issues {
+		if k > 0 {
+			parts = append(parts, "")
+		}
+		parts = append(parts, ticketSection(i)...)
+	}
+	text := strings.Join(parts, "\n")
+	if len(text) > maxPromptBytes {
+		text = strings.ToValidUTF8(text[:maxPromptBytes], "")
+	}
+	return text
+}
+
+func ticketSection(i Issue) []string {
 	labels := make([]string, len(i.Labels.Nodes))
 	for k, l := range i.Labels.Nodes {
 		labels[k] = l.Name
@@ -415,8 +438,7 @@ func buildPrompt(i Issue, request string, previous []string) string {
 	if description == "" {
 		description = "(no description)"
 	}
-	parts := append([]string{request, ""}, previous...)
-	parts = append(parts, fmt.Sprintf("# Linear ticket %s: %s", i.Identifier, i.Title), i.URL, status, "", "## Description", description)
+	parts := []string{fmt.Sprintf("# Linear ticket %s: %s", i.Identifier, i.Title), i.URL, status, "", "## Description", description}
 	if len(i.Comments.Nodes) > 0 {
 		parts = append(parts, "", "## Comments")
 		for _, c := range i.Comments.Nodes {
@@ -427,9 +449,16 @@ func buildPrompt(i Issue, request string, previous []string) string {
 			parts = append(parts, fmt.Sprintf("- %s (%.10s): %s", name, c.CreatedAt, c.Body))
 		}
 	}
-	text := strings.Join(parts, "\n")
-	if len(text) > maxPromptBytes {
-		text = strings.ToValidUTF8(text[:maxPromptBytes], "")
+	return parts
+}
+
+func keysOf(sessions map[string][]Session, id string) []string {
+	var keys []string
+	for key, list := range sessions {
+		if slices.ContainsFunc(list, func(s Session) bool { return s.ID == id }) {
+			keys = append(keys, key)
+		}
 	}
-	return text
+	slices.Sort(keys)
+	return keys
 }

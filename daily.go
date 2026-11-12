@@ -187,13 +187,18 @@ func contentText(raw json.RawMessage) string {
 }
 
 func ticketTopic(text string) string {
-	m := ticketHeader.FindStringSubmatch(text)
-	if m == nil {
+	var titles []string
+	for _, m := range ticketHeader.FindAllStringSubmatch(text, -1) {
+		titles = append(titles, m[1])
+	}
+	if titles == nil {
 		return ""
 	}
 	_, desc, _ := strings.Cut(text, "\n## Description\n")
-	desc, _, _ = strings.Cut(desc, "\n## Comments")
-	return clip(m[1], 200) + " — " + clip(desc, 600)
+	for _, marker := range []string{"\n## Comments", "\n# Linear ticket "} {
+		desc, _, _ = strings.Cut(desc, marker)
+	}
+	return clip(strings.Join(titles, " + "), 300) + " — " + clip(desc, 600)
 }
 
 func request(text string) string {

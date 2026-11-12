@@ -238,3 +238,168 @@ func TestPRNames(t *testing.T) {
 		t.Error("plural")
 	}
 }
+
+func TestGroups(t *testing.T) {
+	a, b := Issue{Identifier: "A-1", Title: "Import sheets", Description: "upload"}, Issue{Identifier: "A-2", Title: "Export sheets"}
+	p := buildPrompt([]Issue{a, b}, "", nil)
+	for _, want := range []string{"Read the tickets below", "These 2 tickets are one piece of work", "# Linear ticket A-1: Import sheets", "# Linear ticket A-2: Export sheets"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("group prompt misses %q", want)
+		}
+	}
+	if got := ticketTopic(p); got != "Import sheets + Export sheets — upload" {
+		t.Errorf("ticketTopic of a group = %q", got)
+	}
+
+	dir := t.TempDir()
+	sessionsFile, statusDir = filepath.Join(dir, "sessions.json"), dir
+	shared := Session{ID: "g1", Name: "together"}
+	writeJSON(sessionsFile, map[string][]Session{"A-1": {shared}, "A-2": {shared, {ID: "solo"}}, "A-3": {shared}})
+	os.WriteFile(filepath.Join(dir, "g1"), []byte("waiting"), 0o600)
+	m := model{live: map[string]string{}}
+	m.sessions, _ = loadSessions()
+	if got := keysOf(m.sessions, "g1"); !slices.Equal(got, []string{"A-1", "A-2", "A-3"}) {
+		t.Errorf("keysOf = %v", got)
+	}
+	if got := m.titleOf("g1"); got != "A-1+A-2+A-3 · together" {
+		t.Errorf("titleOf = %q", got)
+	}
+	if got := m.groupsOf("A-2"); len(got) != 1 || !slices.Equal(got[0].members, []string{"A-1", "A-2", "A-3"}) {
+		t.Errorf("groupsOf = %v", got)
+	}
+	items := []Issue{{Identifier: "A-1"}, {Identifier: "B-9"}, {Identifier: "A-3"}, {Identifier: "B-8"}, {Identifier: "A-2"}}
+	var order []string
+	for _, i := range m.clusterGroups(items) {
+		order = append(order, i.Identifier)
+	}
+	if !slices.Equal(order, []string{"A-1", "A-3", "A-2", "B-9", "B-8"}) {
+		t.Errorf("group members should sit together: %v", order)
+	}
+	m.forget([]string{"A-1"})
+	if _, err := os.Stat(filepath.Join(dir, "g1")); err != nil || len(m.sessions["A-2"]) != 2 {
+		t.Errorf("forgetting a finished ticket must keep the group session for the others: %v %v", err, m.sessions)
+	}
+	m.removeSession("A-2", "g1")
+	if len(keysOf(m.sessions, "g1")) != 0 || len(m.sessions["A-2"]) != 1 {
+		t.Errorf("removing a group session must remove it from every card: %v", m.sessions)
+	}
+}
+
+func TestPickHue(t *testing.T) {
+	var used []int
+	for h := 0; h < 360; h += 15 {
+		if h != 90 {
+			used = append(used, h)
+		}
+	}
+	if got := pickHue(used); got != 90 {
+		t.Errorf("pickHue should take the only free hue, got %d", got)
+	}
+	for range 20 {
+		if got := pickHue([]int{markHue}); got != 90 {
+			t.Errorf("the hue farthest from the mark color is 90, got %d", got)
+		}
+	}
+	if hueColor(0) == hueColor(180) {
+		t.Error("hueColor should change with the hue")
+	}
+}
+
+func TestFold(t *testing.T) {
+	settingsFile = filepath.Join(t.TempDir(), "settings.json")
+	issue := func(key string) Issue {
+		i := Issue{Identifier: key, UpdatedAt: key}
+		i.State = State{Name: "todo", Type: "unstarted"}
+		return i
+	}
+	shared := Session{ID: "g1"}
+	m := model{issues: []Issue{issue("A-1"), issue("B-9"), issue("A-2")}, sessions: map[string][]Session{"A-1": {shared}, "A-2": {shared}}, live: map[string]string{}}
+	m.buildColumns()
+	ids := func() []string {
+		var out []string
+		for _, i := range m.cols[0].items {
+			out = append(out, i.Identifier)
+		}
+		return out
+	}
+	if got := ids(); !slices.Equal(got, []string{"A-2", "A-1", "B-9"}) {
+		t.Fatalf("expanded column = %v", got)
+	}
+	m.row = 1
+	m, _ = m.foldKey("z")
+	if got := ids(); !slices.Equal(got, []string{"A-2", "B-9"}) || len(m.collapsed["A-2"].issues) != 2 || m.row != 0 {
+		t.Errorf("folded column = %v, group %v, cursor row %d", got, m.collapsed["A-2"].issues, m.row)
+	}
+	if saved, _ := loadSettings(); !slices.Equal(saved.CollapsedGroups, []string{"g1"}) {
+		t.Errorf("fold not saved: %v", saved.CollapsedGroups)
+	}
+	m, _ = m.foldKey("z")
+	if got := ids(); len(got) != 3 {
+		t.Errorf("unfold = %v", got)
+	}
+	m, _ = m.foldKey("Z")
+	if len(m.cols[0].items) != 2 {
+		t.Error("Z should fold every group")
+	}
+	m, _ = m.foldKey("Z")
+	if len(m.cols[0].items) != 3 || len(m.settings.CollapsedGroups) != 0 {
+		t.Error("Z again should unfold everything")
+	}
+	m.search.SetValue("A-1")
+	m.buildColumns()
+	m, _ = m.foldKey("z")
+	m, _ = m.foldKey("z")
+	if len(m.settings.CollapsedGroups) != 0 {
+		t.Errorf("z on a card alone in its column must toggle, not pile up: %v", m.settings.CollapsedGroups)
+	}
+}
+
+func TestNotifyTitle(t *testing.T) {
+	cases := map[string]string{
+		"KAN-1118 · fix the glossary search":    "KAN-1118",
+		"KAN-1115+KAN-1116+KAN-1118 · together": "KAN-1115 +2",
+		"shop-web#1990 · answer the threads":    "shop-web#1990",
+		"quick question about go":               "quick question about go",
+	}
+	for in, want := range cases {
+		if got := notifyTitle(in); got != want {
+			t.Errorf("notifyTitle(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMarquee(t *testing.T) {
+	if got := marquee("KAN-1 · KAN-2", 20, 7); got != "KAN-1 · KAN-2" {
+		t.Errorf("text that fits must not move: %q", got)
+	}
+	s := "KAN-1115 · KAN-1116 · KAN-1117"
+	if got := marquee(s, 10, 0); got != "KAN-1115 ·" {
+		t.Errorf("frame 0 = %q", got)
+	}
+	if got := marquee(s, 10, 11); got != "KAN-1116 ·" {
+		t.Errorf("frame 11 = %q", got)
+	}
+	if marquee(s, 10, 3) == marquee(s, 10, 4) {
+		t.Error("each frame should move the text")
+	}
+}
+
+func TestFoldSurvivesFinishedTicket(t *testing.T) {
+	dir := t.TempDir()
+	settingsFile, sessionsFile, statusDir = filepath.Join(dir, "settings.json"), filepath.Join(dir, "sessions.json"), dir
+	issue := func(key string) Issue {
+		i := Issue{Identifier: key, UpdatedAt: key}
+		i.State = State{Name: "todo", Type: "unstarted"}
+		return i
+	}
+	shared := Session{ID: "g1"}
+	writeJSON(sessionsFile, map[string][]Session{"A-1": {shared}, "A-2": {shared}, "A-3": {shared}})
+	m := model{issues: []Issue{issue("A-1"), issue("A-2"), issue("A-3")}, live: map[string]string{}, settings: Settings{CollapsedGroups: []string{"g1"}}}
+	m.sessions, _ = loadSessions()
+	m.issues = m.issues[:2]
+	m.forget([]string{"A-3"})
+	m.buildColumns()
+	if len(m.cols[0].items) != 1 || len(m.collapsed[m.cols[0].items[0].Identifier].issues) != 2 {
+		t.Errorf("the group should stay folded after one ticket finishes: %v", m.cols[0].items)
+	}
+}
