@@ -21,8 +21,8 @@ for c in tmux go claude; do
 done
 
 rebuilt=0
-if [ ! -x "$BIN" ] || [ -n "$(find "$DIR" -maxdepth 1 \( -name '*.go' -o -name go.mod -o -name go.sum \) -newer "$BIN")" ]; then
-  (cd "$DIR" && go build -o "$BIN" .)
+if [ ! -x "$BIN" ] || [ -n "$(find "$DIR/cmd" "$DIR/internal" "$DIR/go.mod" "$DIR/go.sum" \( -name '*.go' -o -name 'go.*' \) -newer "$BIN")" ]; then
+  (cd "$DIR" && go build -o "$BIN" ./cmd/kta)
   rebuilt=1
 fi
 if [ "${1:-}" = setup ]; then

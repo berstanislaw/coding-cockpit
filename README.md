@@ -133,13 +133,14 @@ For the curious, or when something looks off.
 - **PRs on cards.** On Linear, they come from its GitHub integration and show up tagged by repo, like `A#1782`.
 - **Reviews.** On a team PR, `r` asks Claude for a review in the background (`claude -p` with read-only tools). Go through the threads with `←` / `→`. `a` discusses one, `c` rewrites its comment, `x x` drops it, and `s s` sends them all to GitHub as a draft review only you can see.
 - **Daily.** It reads your Claude sessions since the last working day and asks Claude Haiku for one bullet per subject, in the language picked in settings.
-- **Tests.** Run `go test ./...`. They never touch your real config. To build by hand, use `go build -o bin/kta .`.
+- **Code.** `cmd/kta` is the entry point. `internal/` has one package per concern: `config`, `tracker` (Linear and Jira), `store` (sessions, groups, settings), `tmux`, `claude` (launching sessions, hooks, prompts), `github`, `review`, `daily` and `ui` (the board).
+- **Tests.** Run `go test ./...`. They never touch your real config. To build by hand, use `go build -o bin/kta ./cmd/kta`.
 
 ## TODO
 
 - PRs on Jira cards (Jira only exposes them through an undocumented API)
 - Jira Server / Data Center
-- More trackers, like GitHub Projects. A tracker is one file next to `linear.go` and `jira.go`.
+- More trackers, like GitHub Projects. A tracker is one file in `internal/tracker`, next to `linear.go` and `jira.go`.
 
 ## Troubleshooting
 
