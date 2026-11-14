@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,8 +19,7 @@ const dailyPrompt = `You write my daily stand-up notes. The input has my Claude 
 Write the summary in %s, even when the sessions are in another language. For each day, write its heading exactly as given in bold (like **%s**) on its own line, followed by a bullet list. One bullet per card or subject, never one per task: merge everything done on the same card or subject that day into a single bullet. Keep each bullet dumb and short, at the level of these examples, saying what the work was about and not the details of what was done: %s. Describe the subject so anyone on the team understands it: never write ticket identifiers (like KAN-123), session names, people, file paths, ids, URLs, keys or commit hashes. Leave out sessions where nothing real happened, like tests and quick questions. Reply with only the headings and bullets.`
 
 var (
-	dailyDir     = filepath.Join(confDir, "daily")
-	ticketHeader = regexp.MustCompile(`(?m)^# Linear ticket \S+: (.+)$`)
+	ticketHeader = regexp.MustCompile(`(?m)^# (?:Linear|Jira) ticket \S+: (.+)$`)
 	secrets      = regexp.MustCompile(`\b(lin_api|sk-ant|ghp|gho|github_pat|xox[abp])[-_A-Za-z0-9]{8,}`)
 )
 
@@ -63,20 +61,9 @@ func dailyCmd(force bool, lang language) tea.Cmd {
 }
 
 func summarize(notes string, lang language) (string, error) {
-	cmd := exec.Command("claude", "-p", "--model", "haiku", "--no-session-persistence", "--setting-sources", "project", "--strict-mcp-config", "--tools", "", "--system-prompt", fmt.Sprintf(dailyPrompt, lang.prompt, lang.today, lang.examples))
-	cmd.Dir = confDir
-	cmd.Stdin = strings.NewReader(notes)
-	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			cmd.Env = append(cmd.Env, e)
-		}
-	}
-	out, err := cmd.Output()
-	if ee, ok := err.(*exec.ExitError); ok {
-		return "", fmt.Errorf("daily summary failed: %s", strings.TrimSpace(string(ee.Stderr)+string(out)))
-	}
+	out, err := run(confDir, []byte(notes), 5*time.Minute, "claude", "-p", "--model", "haiku", "--no-session-persistence", "--setting-sources", "project", "--strict-mcp-config", "--tools", "", "--system-prompt", fmt.Sprintf(dailyPrompt, lang.prompt, lang.today, lang.examples))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("daily summary failed: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -195,14 +182,14 @@ func ticketTopic(text string) string {
 		return ""
 	}
 	_, desc, _ := strings.Cut(text, "\n## Description\n")
-	for _, marker := range []string{"\n## Comments", "\n# Linear ticket "} {
+	for _, marker := range []string{"\n## Comments", "\n# Linear ticket ", "\n# Jira ticket ", "\n## kta"} {
 		desc, _, _ = strings.Cut(desc, marker)
 	}
 	return clip(strings.Join(titles, " + "), 300) + " — " + clip(desc, 600)
 }
 
 func request(text string) string {
-	for _, marker := range []string{"\n## Previous sessions on this ticket", "\n# Linear ticket "} {
+	for _, marker := range []string{"\n## Previous sessions on this ticket", "\n# Linear ticket ", "\n# Jira ticket "} {
 		text, _, _ = strings.Cut(text, marker)
 	}
 	return text

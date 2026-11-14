@@ -5,29 +5,48 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$DIR/bin/kta"
 T=(tmux -L kta -f "$DIR/tmux.conf")
 
+WS=""
+PICKED=0
+if [ $# -gt 0 ] && [ "$1" != setup ]; then
+  WS="$1"
+  PICKED=1
+  shift
+fi
+[ "$WS" = default ] && WS=""
+case "$WS" in *[!a-z0-9_-]*) echo "workspace names use only a-z, 0-9, - and _"; exit 1 ;; esac
+CMD="exec $(printf %q "$BIN")"
+
 for c in tmux go claude; do
   command -v "$c" >/dev/null || { echo "$c missing (macOS: brew install $c · Arch: sudo pacman -S $c)"; exit 1; }
 done
 
 rebuilt=0
-if [ ! -x "$BIN" ] || [ -n "$(find "$DIR" -maxdepth 1 -name '*.go' -newer "$BIN")" ]; then
+if [ ! -x "$BIN" ] || [ -n "$(find "$DIR" -maxdepth 1 \( -name '*.go' -o -name go.mod -o -name go.sum \) -newer "$BIN")" ]; then
   (cd "$DIR" && go build -o "$BIN" .)
   rebuilt=1
 fi
 if [ "${1:-}" = setup ]; then
-  "$BIN" setup || exit 1
+  KTA_WORKSPACE="$WS" "$BIN" setup || exit 1
   rebuilt=1
 fi
-"$BIN" check || exit 1
+KTA_WORKSPACE="$WS" "$BIN" check || exit 1
 
 if ! "${T[@]}" has-session -t kta 2>/dev/null; then
-  exec "${T[@]}" new-session -s kta -n kta "$BIN"
+  exec "${T[@]}" new-session -s kta -n kta -e "KTA_WORKSPACE=$WS" "$CMD"
 fi
-pane=$("${T[@]}" list-panes -s -t kta -F '#{pane_id} #{pane_current_command}' | awk '$2 == "kta" { print $1; exit }')
+pane=$("${T[@]}" list-panes -s -t kta -F '#{pane_id} #{window_name} #{pane_current_command}' | awk '$2 == "kta" && $3 == "kta" { print $1; exit }')
 if [ -z "$pane" ]; then
-  "${T[@]}" new-window -t kta -n kta "$BIN"
-elif [ "$rebuilt" = 1 ]; then
-  "${T[@]}" respawn-pane -k -t "$pane" "$BIN"
+  "${T[@]}" new-window -t kta: -n kta -e "KTA_WORKSPACE=$WS" "$CMD"
+else
+  cur=$("${T[@]}" display -p -t "$pane" '#{@kta_workspace}')
+  if [ "$PICKED" = 1 ] && [ "$WS" != "$cur" ]; then
+    "${T[@]}" list-panes -a -F '#{pane_id} #{@kta_session}' | awk '$2 != "" { print $1 }' | while read -r p; do
+      "${T[@]}" kill-pane -t "$p"
+    done
+    "${T[@]}" respawn-pane -k -t "$pane" -e "KTA_WORKSPACE=$WS" "$CMD"
+  elif [ "$rebuilt" = 1 ]; then
+    "${T[@]}" respawn-pane -k -t "$pane" -e "KTA_WORKSPACE=$cur" "$CMD"
+  fi
 fi
 "${T[@]}" source-file "$DIR/tmux.conf"
 "${T[@]}" select-window -t kta:kta

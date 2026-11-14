@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -22,7 +21,6 @@ type Settings struct {
 	NotificationsOff bool     `json:"notificationsOff,omitempty"`
 	HiddenTabs       []string `json:"hiddenTabs,omitempty"`
 	ReviewLabels     []string `json:"reviewLabels,omitempty"`
-	CollapsedGroups  []string `json:"collapsedGroups,omitempty"`
 }
 
 type language struct {
@@ -38,8 +36,7 @@ type settingItem struct {
 type statesMsg []State
 
 var (
-	settingsFile = filepath.Join(confDir, "settings.json")
-	languages    = []language{
+	languages = []language{
 		{"pt", "português", "Brazilian Portuguese", "hoje", `"trabalhei no card que falava de importação de planilhas", "revisei um PR da tela de estoque", "investiguei um bug de permissão no catálogo"`, []string{"domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"}},
 		{"en", "english", "English", "today", `"worked on the card about spreadsheet imports", "reviewed a PR for the stock screen", "looked into a permission bug in the catalog"`, []string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}},
 		{"es", "español", "Spanish", "hoy", `"trabajé en la tarjeta sobre importación de planillas", "revisé un PR de la pantalla de stock", "investigué un bug de permisos en el catálogo"`, []string{"domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"}},
@@ -100,13 +97,19 @@ func toggle(list []string, v string) []string {
 	return append(slices.Clone(list), v)
 }
 
-func statesCmd(issues []Issue) tea.Cmd {
+func teamKeys(issues []Issue) []string {
 	var teams []string
 	for _, i := range issues {
 		if !slices.Contains(teams, i.Team.Key) {
 			teams = append(teams, i.Team.Key)
 		}
 	}
+	slices.Sort(teams)
+	return teams
+}
+
+func statesCmd(issues []Issue) tea.Cmd {
+	teams := teamKeys(issues)
 	return func() tea.Msg {
 		states, err := fetchStates(teams)
 		if err != nil {

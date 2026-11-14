@@ -123,7 +123,7 @@ func linear(query string, vars map[string]any, out any) error {
 	return json.Unmarshal(r.Data, out)
 }
 
-func fetchBoard(sources []string) ([]Issue, error) {
+func linearBoard(sources []string) ([]Issue, error) {
 	me := map[string]any{"isMe": map[string]any{"eq": true}}
 	var who []map[string]any
 	for _, src := range ticketSources {
@@ -131,7 +131,7 @@ func fetchBoard(sources []string) ([]Issue, error) {
 			who = append(who, map[string]any{src.field: me})
 		}
 	}
-	filter := map[string]any{"or": who, "state": map[string]any{"type": map[string]any{"nin": []string{"completed", "canceled", "duplicate"}}}}
+	filter := map[string]any{"or": who}
 	var issues []Issue
 	var after *string
 	for {
@@ -156,7 +156,7 @@ func fetchBoard(sources []string) ([]Issue, error) {
 	}
 }
 
-func fetchDone(keys []string) ([]string, error) {
+func linearDone(keys []string) ([]string, error) {
 	var d struct {
 		Issues struct{ Nodes []struct{ Identifier string } }
 	}
@@ -170,13 +170,13 @@ func fetchDone(keys []string) ([]string, error) {
 	return out, nil
 }
 
-func viewerName() (string, error) {
+func linearViewer() (string, error) {
 	var d struct{ Viewer struct{ Name string } }
 	err := linear(`{ viewer { name } }`, nil, &d)
 	return d.Viewer.Name, err
 }
 
-func fetchStates(teams []string) ([]State, error) {
+func linearStates(teams []string) ([]State, error) {
 	var d struct {
 		Teams struct {
 			Nodes []struct{ States struct{ Nodes []State } }
@@ -192,7 +192,7 @@ func fetchStates(teams []string) ([]State, error) {
 	return out, nil
 }
 
-func fetchIssue(key string) (Issue, error) {
+func linearIssue(key string) (Issue, error) {
 	var d struct{ Issue Issue }
 	if err := linear(issueQuery, map[string]any{"id": key}, &d); err != nil {
 		return Issue{}, err

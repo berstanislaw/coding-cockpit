@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -48,7 +47,15 @@ func runHook(title, event string, r io.Reader) {
 	if s, _ := loadSettings(); s.NotificationsOff || paneInView() {
 		return
 	}
-	notify(notifyTitle(title), body)
+	notify(liveTitle(in.SessionID, title), body)
+}
+
+func liveTitle(id, title string) string {
+	sessions, groups, err := loadState()
+	if t := (model{sessions: sessions, groups: groups}).titleOf(id); err == nil && t != "" {
+		title = t
+	}
+	return notifyTitle(title)
 }
 
 func notifyTitle(title string) string {
@@ -85,14 +92,6 @@ func running(in hookInput) string {
 func paneInView() bool {
 	out, err := tmux("display", "-p", "-t", os.Getenv("TMUX_PANE"), "#{window_active}#{m:*focused*,#{client_flags}}")
 	return err == nil && out == "11"
-}
-
-func notify(title, body string) {
-	if _, err := exec.LookPath("notify-send"); err == nil {
-		exec.Command("notify-send", "-a", "kta", title, body).Run()
-		return
-	}
-	exec.Command("osascript", "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", title, body).Run()
 }
 
 func printTranscript(file string, w io.Writer) error {

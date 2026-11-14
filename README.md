@@ -1,6 +1,6 @@
 # KTA - Kanban Terminal for Agents
 
-A terminal kanban of your Linear tickets that runs Claude Code sessions right next to them.
+A terminal kanban of your Linear or Jira tickets that runs Claude Code sessions right next to them.
 
 Juggling a dozen tickets and a dozen Claude sessions gets messy fast. You lose track of which terminal belongs to which card, which session is waiting for you, and which one finished an hour ago. kta puts everything in one place: your tickets on the left, the Claude session you're looking at on the right, and a status dot on every card so you can see at a glance what's running.
 
@@ -23,7 +23,7 @@ It's a small Go program running inside its own tmux server, so it's fast and doe
 
 - **tmux** and **Go**. It's tested with tmux 3.7 and Go 1.27.
 - **Claude Code** (`claude`), installed and logged in.
-- A **Linear personal API key**: in Linear, go to Settings → Account → Security & access → Personal API keys.
+- A **Linear personal API key** (Settings → Account → Security & access → Personal API keys), or a **Jira Cloud** account with an API token (id.atlassian.com → Security → Create and manage API tokens).
 - For the reviews tab, the **GitHub CLI** (`gh`), logged in with `gh auth login`.
 - For notifications on Linux, `notify-send` plus a notification daemon such as dunst or mako, or the one your desktop already ships. On macOS they work out of the box.
 - **Linux or macOS.** On Windows it runs inside WSL, since tmux doesn't run on Windows itself. Install everything inside WSL and start `./kta` from a WSL terminal. Desktop notifications don't reach Windows from there.
@@ -47,16 +47,28 @@ git clone <this repo> ~/projects/kta
 ~/projects/kta/kta
 ```
 
-The first run asks for two things:
+The first run opens a short setup on screen:
 
-1. **Your Linear API key.** Paste it in (it doesn't show on screen) and the board checks it with Linear right away, telling you whose account it is.
-2. **The folder where Claude sessions start**, usually the repo or workspace you work in. `~/…` works.
+1. **Where your tickets live**: Linear or Jira (Cloud).
+2. **Your account.** For Linear, a personal API key (Settings → Account → Security & access → Personal API keys). For Jira, your site (`acme.atlassian.net`, or just `acme`), the email you sign in with, and an API token from id.atlassian.com → Security → Create and manage API tokens. `enter` checks it right away and shows whose account it is.
+3. **The folder where Claude sessions start**, usually the repo or workspace you work in. `~/…` works.
 
-They're saved to `~/.config/kta/env`, readable only by you. To change them later, run `./kta setup`, or edit the file by hand:
+It's saved to `~/.config/kta/env`, readable only by you. To change it later, run `./kta setup` (secrets left empty keep the current ones), or edit the file by hand:
 
 ```sh
-LINEAR_API_KEY=lin_api_…
-WORKSPACE_DIR=~/projects/my-workspace
+TRACKER='linear'
+LINEAR_API_KEY='lin_api_…'
+WORKSPACE_DIR='~/projects/my-workspace'
+```
+
+or, for Jira:
+
+```sh
+TRACKER='jira'
+JIRA_URL='https://acme.atlassian.net'
+JIRA_EMAIL='you@acme.com'
+JIRA_API_TOKEN='…'
+WORKSPACE_DIR='~/projects/my-workspace'
 ```
 
 The first run compiles the binary, which takes a few seconds. After that, `./kta` rebuilds on its own whenever the code changes, so updating is just `git pull` and running `./kta` again.
@@ -69,19 +81,28 @@ alias kta=~/projects/kta/kta
 
 Running `./kta` again while it's already open re-attaches to the same board instead of starting a second one.
 
-### Claude and Linear
+### Workspaces
 
-Every Claude session started by the board gets your key as `$LINEAR_API_KEY`, so Claude can read tickets or move cards through the Linear API with no extra setup. Claude just needs to know it's there. A line like this in your `CLAUDE.md` does it:
+One workspace is one tracker account plus the folder where Claude starts. To keep a second one, say a Jira project next to your Linear one, press `alt+w` anywhere (also from inside a Claude session) to open the workspace picker:
 
-> To read or move Linear tickets, call `https://api.linear.app/graphql` with `$LINEAR_API_KEY` as the `Authorization` header (no `Bearer`).
+- type to filter, `↑`/`↓` (or `ctrl+n`/`ctrl+p`) to move, `enter` to open, `esc` to close
+- typing a name that doesn't exist offers to create it, and opening it runs the same setup as the first run. `ctrl+c` there goes back to where you were
 
-Sessions you start outside the board (your editor, a plain terminal) don't get the variable.
+Only one board runs at a time: opening another workspace **stops every Claude session of the current one** (the picker warns how many are running) and reopens the board on the other. Nothing is lost, the sessions stay listed and resume with `enter` when you come back.
+
+From the terminal, `./kta jira` opens that workspace directly, `./kta default` goes back to the default one, and plain `./kta` re-attaches to whatever is open. The default workspace lives in `~/.config/kta/`, the others in `~/.config/kta/workspaces/<name>/`, each with its own key, folder, sessions, groups and settings. `./kta jira setup` changes a workspace's key or folder.
+
+### Claude and your tracker
+
+Every Claude session started by the board gets the workspace's credentials as environment variables (`$LINEAR_API_KEY`, or `$JIRA_URL`, `$JIRA_EMAIL` and `$JIRA_API_TOKEN`), and kta tells it how to use them: Linear's GraphQL API, or Jira's REST API with transitions to move a card. So "move this ticket to In Review" works with no extra setup.
+
+Sessions you start outside the board (your editor, a plain terminal) don't get the variables.
 
 ## How to use it
 
 ### The kanban
 
-You see every ticket assigned to you that isn't done, canceled or a duplicate, grouped into columns by status. In settings you can also bring in the tickets you created or subscribed to, and hide the columns you don't care about. Tickets with a running session sit at the top of their column, then the ones with stopped sessions, then everything else. The board refreshes from Linear every 30 seconds, so moving a card in Linear shows up here on its own.
+You see every ticket assigned to you, in every status, with one column per status of your tickets' teams (or Jira projects), even the empty ones, from triage and backlog to done and canceled. In settings you can also bring in the tickets you created or subscribed to, and hide the columns you don't care about, like done and canceled. Tickets with a running session sit at the top of their column, then the ones with stopped sessions, then everything else. The board refreshes from your tracker every 30 seconds, so moving a card there shows up here on its own.
 
 Press `enter` on a card to open it in a panel under the kanban. You get the description and comments rendered as markdown, plus that ticket's Claude sessions.
 
@@ -91,7 +112,7 @@ Press `n` on a ticket and write what you want Claude to do. Claude gets your req
 
 Every session starts in `WORKSPACE_DIR`. A ticket can have as many sessions as you want, and they're remembered across restarts. A stopped session comes back with `enter`, which resumes the same Claude conversation.
 
-Once a ticket is finished in Linear, meaning any completed or canceled status (in production, done, canceled, duplicate), it leaves the board and the board forgets its sessions and PRs. A session that's still running is kept until it stops. Claude's own transcripts aren't touched, so the daily summary still counts that work.
+Once a ticket is finished, meaning any completed or canceled status (in production, done, canceled, duplicate), the board forgets its sessions and takes it out of its group. The ticket itself stays in its column, unless you hide that column in settings. A session that's still running is kept until it stops. Claude's own transcripts aren't touched, so the daily summary still counts that work.
 
 Each session shows a status:
 
@@ -106,7 +127,18 @@ Cards show the same dots, with a number when more than one session is in the sam
 
 ### Several tickets at once
 
-When a few tickets are really one piece of work, mark them with `g` (they get a double purple border and a `✓`), then press `n`. That starts one session with all of them in the prompt, told to handle them together. The session belongs to every ticket in the group. Each group gets its own color, picked at random among the ones farthest from the colors already in use. Cards of a group that share a column sit together, joined by a bar in that color on their left; each card also shows a colored `◆`, the ticket panel says who else is in it (`◆ with KAN-1118 KAN-1119`), and when the cursor is on one of them, the others light up. `esc` clears the marks. `z` folds a group into a single card (`◆ 3 cards`) and `z` again unfolds it. When the tickets don't fit, their numbers scroll by, and the line below cycles through each ticket's title every few seconds. `Z` folds or unfolds every group at once, and the board remembers what's folded. On a folded card, `n` starts a session for the whole group and `p` opens the PRs of all of its tickets. Removing the session removes it from the whole group, and a ticket that's finished leaves the group without taking the session from the others.
+When a few tickets are really one piece of work, mark them with `g` (they get a double purple border and a `✓`), then press `n`. That starts one session with all of them in the prompt, told to handle them together. The session belongs to every ticket in the group. Each group gets its own color, picked at random among the ones farthest from the colors already in use. Cards of a group that share a column sit together, joined by a bar in that color on their left; each card also shows a colored `◆`, the ticket panel says who else is in it (`◆ with KAN-1118 KAN-1119`), and when the cursor is on one of them, the others light up. `esc` clears the marks. `z` folds a group into a single card (`◆ 3 cards`) and `z` again unfolds it. When the tickets don't fit, their numbers scroll by, and the line below cycles through each ticket's title every few seconds. `Z` folds or unfolds every group at once, and the board remembers what's folded. On a folded card, `n` starts a session for the whole group and `p` opens the PRs of all of its tickets.
+
+A group is its own thing, with an id, saved in `~/.config/kta/groups.json`, and a ticket belongs to one group at most. To change who's in it, just ask the session, like "add KAN-1120 to this", "bring KAN-1117 over here" or "take KAN-1117 out". Every session started by kta knows its own id (`$KTA_SESSION`) and is told about the commands:
+
+| command | does |
+| --- | --- |
+| `kta group` | lists the tickets of this session's group |
+| `kta group add KAN-123 …` | adds tickets, moving them out of any other group, and prints them in full so Claude reads them right away. On a session of a single ticket, it turns it into a group. |
+| `kta group remove KAN-123 …` | takes tickets out. A group keeps at least one. |
+| `kta groups` | lists every group with its id and sessions |
+
+Add `--group <id>` to change a group other than the session's own. The board picks changes up within a couple of seconds. A finished ticket leaves its group on its own, and removing a group's last session (`d d`) ends the group.
 
 ### PRs on cards
 
@@ -157,7 +189,7 @@ The `5` tab is where you make the board yours. Move with `↑` / `↓`, toggle w
 
 | setting | what it does |
 | --- | --- |
-| Columns | which status columns show up on the kanban. It lists every status of your tickets' teams, and a status that's new in Linear shows up on its own. |
+| Columns | which status columns show up on the kanban. It lists every status of your tickets' teams (or Jira projects), and a new status shows up on its own. |
 | Tickets | which tickets come in: assigned to you, created by you, subscribed to. Pick at least one. |
 | Daily language | the language of the daily summary: Portuguese, English or Spanish |
 | Notifications | the desktop notifications. The status dots keep working either way. |
@@ -175,6 +207,7 @@ Anywhere:
 | `alt+1` … `alt+5` | switch tabs, also from inside a Claude session |
 | `?` | every key for the screen you're on |
 | `alt+←` / `alt+→` | move between the board and the Claude session |
+| `alt+w` | open the workspace picker |
 | `q` / `ctrl+c` | quit |
 
 On the kanban:
@@ -239,14 +272,16 @@ If you're curious, or something looks off:
 - **The tmux server.** The board runs in its own tmux server (`tmux -L kta`), with the settings in `tmux.conf`. Your own tmux is never touched.
 - **Sessions are tmux windows.** Each Claude session runs in its own tmux window. The one you're looking at is moved next to the board, and the others wait in the background.
 - **Status comes from Claude Code hooks.** The hooks are passed with `--settings` when a session starts. They call `kta hook`, which writes the status to a small file and sends the notification.
-- **State lives in `~/.config/kta/`.** That's `sessions.json` (which sessions belong to which ticket or PR), `settings.json`, `status/`, `daily/` and `reviews/`. The conversations themselves are Claude's own transcripts in `~/.claude/projects/`.
+- **State lives in `~/.config/kta/`**, or `~/.config/kta/workspaces/<name>/` for a named workspace. That's `env`, `sessions.json` (which sessions belong to which ticket, group or PR), `groups.json`, `settings.json`, `status/`, `daily/` and `reviews/`. Writes to `sessions.json` and `groups.json` take a file lock, so the board and `kta group` running inside Claude never step on each other. The conversations themselves are Claude's own transcripts in `~/.claude/projects/`.
 - **The daily summary** runs `claude -p --model haiku` with no tools, no hooks and no saved session.
 - **Reviews** use `gh` for everything on GitHub, and `claude -p` limited to Read, Grep and Glob, so a review running in the background can't change your files.
-- **Tests** cover the logic that's easy to break without noticing: PR tags, columns and their order, settings, the daily window, forgetting finished tickets, the status hook, and applying Claude's answers to a review. Run `go test ./...` before sending a change.
+- **Tests** cover the logic that's easy to break without noticing: PR tags, columns and their order, settings, the daily window, forgetting finished tickets, the status hook, and applying Claude's answers to a review. Run `go test ./...` before sending a change; tests never touch your real `~/.config/kta`. To build by hand, use `go build -o bin/kta .` (a plain `go build` collides with the `kta` script).
 
 ## TODO
 
-- **More kanbans.** Today it only reads Linear. Next would be Jira (Cloud): tickets come from JQL, columns from each project's statuses, and Claude can move cards through transitions. The tricky parts are the descriptions, which come as Atlassian Document Format and need converting to markdown, and the linked PRs, which only come from an undocumented API. Other trackers like GitHub Projects could follow the same path.
+- **PRs on Jira cards.** Linear lists a ticket's PRs as attachments; Jira only exposes them through the undocumented dev-status API, so Jira cards don't show PRs yet.
+- **Jira Server / Data Center**, which use personal access tokens instead of email + API token.
+- **More trackers**, like GitHub Projects. A tracker is a small file next to `linear.go` and `jira.go` with the same five calls (board, ticket, done, states, account).
 
 ## Troubleshooting
 

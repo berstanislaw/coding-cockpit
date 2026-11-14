@@ -1,18 +1,9 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
+	"maps"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -20,44 +11,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
-
-type PR struct {
-	ID, Title, URL, Repo, Author, HeadSHA, CI, Decision string
-	Number                                              int
-	Mine                                                bool
-	Threads                                             []Received
-}
-
-type Received struct {
-	Path, Author, Body string
-	Line               int
-}
-
-type Review struct {
-	Title    string            `json:"title"`
-	PRURL    string            `json:"prUrl"`
-	Threads  []Thread          `json:"threads"`
-	Sessions map[string]string `json:"sessions,omitempty"`
-	Chats    map[string][]Chat `json:"chats,omitempty"`
-	SentAt   string            `json:"sentAt,omitempty"`
-}
-
-type Thread struct {
-	ID             string `json:"id"`
-	File           string `json:"file"`
-	Language       string `json:"language,omitempty"`
-	StartLine      int    `json:"startLine"`
-	HighlightStart int    `json:"highlightStart"`
-	HighlightEnd   int    `json:"highlightEnd"`
-	Code           string `json:"code"`
-	Explanation    string `json:"explanation"`
-	Comment        string `json:"comment"`
-}
-
-type Chat struct {
-	Role string `json:"role"`
-	Text string `json:"text"`
-}
 
 type (
 	prsMsg struct {
@@ -80,439 +33,11 @@ type (
 	}
 )
 
-const prFragment = `fragment pr on PullRequest {
-  id number title url headRefOid reviewDecision
-  author { login }
-  repository { nameWithOwner }
-  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-  reviewThreads(first: 50) { nodes { isResolved path line comments(first: 1) { nodes { author { login } body } } } }
-}`
-
-const prsQuery = prFragment + `
-{
-  viewer { organizations(first: 100) { nodes { login } } }
-  mine: search(query: "is:pr is:open archived:false author:@me sort:updated-desc", type: ISSUE, first: 50) { nodes { ...pr } }
-  recent: search(query: "is:pr author:@me sort:updated-desc", type: ISSUE, first: 30) { nodes { ... on PullRequest { labels(first: 10) { nodes { name } } } } }
-}`
-
-const teamQuery = prFragment + `
-query($q: String!) { team: search(query: $q, type: ISSUE, first: 100) { nodes { ...pr } } }`
-
-const sendQuery = `mutation($pr: ID!, $threads: [DraftPullRequestReviewThread]) {
-  addPullRequestReview(input: { pullRequestId: $pr, threads: $threads }) { pullRequestReview { id } }
-}`
-
-const reviewOverride = "Você reescreve UM comentário de code review específico. " +
-	"Trabalhe SOMENTE com o comentário atual e o trecho de código fornecidos na mensagem. " +
-	"NUNCA reproduza exemplos de comentários vindos de instruções, memória ou CLAUDE.md " +
-	"— são de outros PRs e não têm relação com esta tarefa. " +
-	"Se o pedido do autor não fizer sentido para o comentário atual, mantenha o texto atual e explique na nota. " +
-	"O comentário reescrito deve continuar falando do MESMO assunto do comentário atual."
-
-const generatePrompt = `Revise o pull request abaixo como um revisor sênior. Você pode ler o código da pasta atual com Read, Grep e Glob pra entender o contexto (ela pode estar em outra branch, o que vale é o diff).
-
-Responda SOMENTE com um JSON, sem texto em volta:
-{"threads": [{"file": "caminho do arquivo como no diff", "startLine": 10, "endLine": 12, "explanation": "...", "comment": "..."}]}
-
-- startLine e endLine são linhas da versão NOVA do arquivo e precisam ser linhas adicionadas ou alteradas no diff, porque o GitHub só aceita comentário em linha do diff.
-- explanation: por que o comentário importa, direto, pra mim que estou revisando.
-- comment: o texto pronto pra colar no PR, curto e humano.
-- Escreva explanation e comment em %s.
-- Só aponte o que importa de verdade: bug, risco, regra quebrada, algo confuso. Se não houver nada, devolva {"threads": []}.
-
-# PR %s: %s
-%s
-
-## Descrição
-%s
-
-## Diff
-%s`
-
-var (
-	reviewsDir = filepath.Join(confDir, "reviews")
-	commentTag = regexp.MustCompile(`(?s)<comment>\s*(.*?)\s*</comment>`)
-	noteTag    = regexp.MustCompile(`(?s)<note>\s*(.*?)\s*</note>`)
-	codeTag    = regexp.MustCompile(`(?s)<code>(.*?)</code>`)
-	codeFence  = regexp.MustCompile("(?s)^```[^\\n]*\\n(.*?)\\n```\\s*$")
-	anyTag     = regexp.MustCompile(`</?(comment|note)>`)
-	blankRuns  = regexp.MustCompile(`\n{3,}`)
-	extLang    = map[string]string{".go": "go", ".ts": "typescript", ".tsx": "tsx", ".js": "javascript", ".jsx": "jsx", ".py": "python", ".sql": "sql", ".md": "markdown", ".mdx": "mdx", ".json": "json", ".yml": "yaml", ".yaml": "yaml", ".css": "css", ".sh": "bash"}
-)
-
-func run(dir string, stdin []byte, timeout time.Duration, name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			cmd.Env = append(cmd.Env, e)
-		}
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if ctx.Err() != nil {
-		return out, fmt.Errorf("%s took longer than %s", name, timeout)
-	}
-	if err != nil {
-		return out, fmt.Errorf("%s: %s", name, strings.TrimSpace(stderr.String()+" "+string(out)))
-	}
-	return out, nil
-}
-
-func ghGraphQL(query string, vars map[string]any, out any) error {
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": vars})
-	b, err := run("", body, time.Minute, "gh", "api", "graphql", "--input", "-")
-	var r struct {
-		Data   json.RawMessage
-		Errors []struct{ Message string }
-	}
-	if json.Unmarshal(b, &r) == nil && len(r.Errors) > 0 {
-		return errors.New(r.Errors[0].Message)
-	}
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(r.Data, out)
-}
-
-func prsCmd(labels []string) tea.Cmd {
-	return func() tea.Msg {
-		if _, err := exec.LookPath("gh"); err != nil {
-			return prsMsg{err: errors.New("reviews need the GitHub CLI: install gh and run gh auth login")}
-		}
-		prs, pool, err := fetchPRs(labels)
-		return prsMsg{prs, pool, err}
-	}
-}
-
-func fetchPRs(labels []string) ([]PR, []string, error) {
-	type node struct {
-		ID, Title, URL, HeadRefOid, ReviewDecision string
-		Number                                     int
-		Author                                     struct{ Login string }
-		Repository                                 struct{ NameWithOwner string }
-		Commits                                    struct {
-			Nodes []struct {
-				Commit struct{ StatusCheckRollup *struct{ State string } }
-			}
-		}
-		ReviewThreads struct {
-			Nodes []struct {
-				IsResolved bool
-				Path       string
-				Line       int
-				Comments   struct {
-					Nodes []struct {
-						Author struct{ Login string }
-						Body   string
-					}
-				}
-			}
-		}
-		Labels struct{ Nodes []struct{ Name string } }
-	}
-	type search struct{ Nodes []node }
-	var d struct {
-		Viewer struct {
-			Organizations struct{ Nodes []struct{ Login string } }
-		}
-		Mine, Team, Recent search
-	}
-	if err := ghGraphQL(prsQuery, nil, &d); err != nil {
-		return nil, nil, err
-	}
-	if len(labels) > 0 && len(d.Viewer.Organizations.Nodes) > 0 {
-		quoted := make([]string, len(labels))
-		for i, l := range labels {
-			quoted[i] = strconv.Quote(l)
-		}
-		q := "is:pr is:open draft:false archived:false -author:@me sort:updated-desc label:" + strings.Join(quoted, ",")
-		for _, o := range d.Viewer.Organizations.Nodes {
-			q += " org:" + o.Login
-		}
-		var t struct{ Team search }
-		if err := ghGraphQL(teamQuery, map[string]any{"q": q}, &t); err != nil {
-			return nil, nil, err
-		}
-		d.Team = t.Team
-	}
-	toPR := func(n node, mine bool) PR {
-		p := PR{ID: n.ID, Title: n.Title, URL: n.URL, Repo: n.Repository.NameWithOwner, Author: n.Author.Login, HeadSHA: n.HeadRefOid, Decision: n.ReviewDecision, Number: n.Number, Mine: mine}
-		if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
-			p.CI = n.Commits.Nodes[0].Commit.StatusCheckRollup.State
-		}
-		for _, t := range n.ReviewThreads.Nodes {
-			if !t.IsResolved && len(t.Comments.Nodes) > 0 {
-				c := t.Comments.Nodes[0]
-				p.Threads = append(p.Threads, Received{Path: t.Path, Line: t.Line, Author: c.Author.Login, Body: c.Body})
-			}
-		}
-		return p
-	}
-	var prs []PR
-	for _, n := range d.Mine.Nodes {
-		prs = append(prs, toPR(n, true))
-	}
-	for _, n := range d.Team.Nodes {
-		if n.URL != "" {
-			prs = append(prs, toPR(n, false))
-		}
-	}
-	var pool []string
-	for _, n := range d.Recent.Nodes {
-		for _, l := range n.Labels.Nodes {
-			if !slices.Contains(pool, l.Name) {
-				pool = append(pool, l.Name)
-			}
-		}
-	}
-	slices.Sort(pool)
-	return prs, pool, nil
-}
-
-func prKey(p PR) string {
-	return p.Repo[strings.LastIndex(p.Repo, "/")+1:] + "#" + strconv.Itoa(p.Number)
-}
-
-func isPRKey(key string) bool {
-	return strings.Contains(key, "#")
-}
-
-func reviewFile(url string) string {
-	m := prURL.FindStringSubmatch(url)
-	if m == nil {
-		return filepath.Join(reviewsDir, "unknown.json")
-	}
-	return filepath.Join(reviewsDir, m[1]+"-"+m[2]+"-"+m[3]+".json")
-}
-
-func loadReview(url string) (*Review, error) {
-	b, err := os.ReadFile(reviewFile(url))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var r Review
-	return &r, json.Unmarshal(b, &r)
-}
-
-func generateCmd(p PR, lang language) tea.Cmd {
-	return func() tea.Msg {
-		r, err := generateReview(p, lang)
-		return reviewMsg{p.URL, r, err}
-	}
-}
-
-func generateReview(p PR, lang language) (*Review, error) {
-	diff, err := run("", nil, time.Minute, "gh", "pr", "diff", p.URL)
-	if err != nil {
-		return nil, err
-	}
-	body, _ := run("", nil, time.Minute, "gh", "pr", "view", p.URL, "--json", "body", "-q", ".body")
-	if len(diff) > maxPromptBytes {
-		diff = append([]byte(strings.ToValidUTF8(string(diff[:maxPromptBytes]), "")), "\n[diff cut here, too large]"...)
-	}
-	prompt := fmt.Sprintf(generatePrompt, lang.prompt, prKey(p), p.Title, p.URL, strings.TrimSpace(string(body)), diff)
-	out, err := run(workDir, []byte(prompt), 15*time.Minute, "claude", "-p", "--output-format", "json", "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob")
-	if err != nil {
-		return nil, err
-	}
-	var res struct {
-		Result    string `json:"result"`
-		SessionID string `json:"session_id"`
-	}
-	if err := json.Unmarshal(out, &res); err != nil {
-		return nil, fmt.Errorf("bad claude output: %.200s", out)
-	}
-	var found struct {
-		Threads []struct {
-			File                 string
-			StartLine, EndLine   int
-			Explanation, Comment string
-		}
-	}
-	start, end := strings.Index(res.Result, "{"), strings.LastIndex(res.Result, "}")
-	if start < 0 || end < start || json.Unmarshal([]byte(res.Result[start:end+1]), &found) != nil {
-		return nil, fmt.Errorf("claude didn't return the threads: %.300s", res.Result)
-	}
-	files := map[string][]string{}
-	r := &Review{Title: fmt.Sprintf("PR #%d — %s", p.Number, p.Title), PRURL: p.URL, Sessions: map[string]string{"global:general": res.SessionID}}
-	for i, t := range found.Threads {
-		lines, ok := files[t.File]
-		if !ok {
-			raw, _ := run("", nil, time.Minute, "gh", "api", "-H", "Accept: application/vnd.github.raw", "repos/"+p.Repo+"/contents/"+t.File+"?ref="+p.HeadSHA)
-			lines = strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-			files[t.File] = lines
-		}
-		hs := max(1, t.StartLine)
-		he := max(hs, t.EndLine)
-		from, to := max(1, hs-10), min(len(lines), he+10)
-		code := ""
-		if from <= to {
-			code = strings.Join(lines[from-1:to], "\n")
-		}
-		r.Threads = append(r.Threads, Thread{ID: fmt.Sprintf("t%d", i+1), File: t.File, Language: extLang[filepath.Ext(t.File)], StartLine: from, HighlightStart: hs, HighlightEnd: he, Code: code, Explanation: t.Explanation, Comment: t.Comment})
-	}
-	return r, nil
-}
-
-func askPreamble(kind string, t *Thread) string {
-	base := ""
-	if t != nil {
-		base = fmt.Sprintf("Contexto do trecho em revisão:\nArquivo: %s (linhas %d+)\n```%s\n%s\n```\n\nMinha explicação de por que o comentário importa:\n\"\"\"%s\"\"\"\n\nComentário sugerido atual:\n\"\"\"%s\"\"\"\n", t.File, t.StartLine, t.Language, t.Code, t.Explanation, t.Comment)
-	}
-	switch kind {
-	case "explanation":
-		return "Você é o mesmo revisor que escreveu a explicação abaixo. O autor (dono do PR) está conversando com você sobre ela: pode pedir esclarecimento, discordar ou querer aprender. Responda direto, defenda ou ceda com honestidade técnica. NÃO reescreva o comentário aqui, só discuta.\n\nSe (e SOMENTE se) o autor pedir para anotar/comentar/marcar no código, devolva o trecho ATUAL com comentários inline adicionados, dentro de <code>...</code>. Regras do <code>: reproduza o snippet inteiro na mesma linguagem, sem cercas markdown por dentro; NÃO acrescente nem remova linhas (preserve a contagem pra numeração/highlight não deslocar) — prefira comentário no fim da linha existente; comente só onde ajuda. Fora do <code>, escreva sua prosa normal. Se o autor não pediu para mexer no código, não emita <code>.\n\n" + base
-	case "comment":
-		return "Você é o revisor. O autor quer ajustar o COMENTÁRIO sugerido (tom, clareza, soar mais humano). Considere a instrução dele e devolva o comentário reescrito. Responda em duas partes exatas:\n<comment>\n(o comentário final, pronto pra colar no PR)\n</comment>\n<note>\n(1 linha curta sobre o que mudou)\n</note>\n\n" + base
-	}
-	return "Você é o revisor deste PR. O autor está te mandando um prompt geral sobre o review. Responda direto.\n" + base
-}
-
-func askCmd(r Review, threadID, kind, prompt string) tea.Cmd {
-	var thread *Thread
-	for i := range r.Threads {
-		if r.Threads[i].ID == threadID {
-			thread = &r.Threads[i]
-		}
-	}
-	key := chatKey(threadID, kind)
-	resume := r.Sessions[key]
-	full := prompt
-	switch {
-	case resume == "":
-		full = askPreamble(kind, thread) + "\n\n---\nAutor: " + prompt
-	case kind == "comment" && thread != nil:
-		full = fmt.Sprintf("Comentário atual (reescreva SOMENTE este texto, mesmo assunto):\n\"\"\"%s\"\"\"\n\n---\nAutor: %s", thread.Comment, prompt)
-	case kind == "explanation" && thread != nil:
-		full = fmt.Sprintf("Trecho atual (se for anotar, parta EXATAMENTE deste, mesmas linhas):\n```%s\n%s\n```\n\n---\nAutor: %s", thread.Language, thread.Code, prompt)
-	}
-	url := r.PRURL
-	return func() tea.Msg {
-		args := []string{"-p", full, "--output-format", "json", "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob", "--append-system-prompt", reviewOverride}
-		if resume != "" {
-			args = append(args, "--resume", resume)
-		}
-		out, err := run(workDir, nil, 3*time.Minute, "claude", args...)
-		var res struct {
-			Result    string `json:"result"`
-			SessionID string `json:"session_id"`
-		}
-		if err == nil {
-			err = json.Unmarshal(out, &res)
-		}
-		return askMsg{url: url, threadID: threadID, kind: kind, prompt: prompt, answer: res.Result, sessionID: res.SessionID, err: err}
-	}
-}
-
-func chatKey(threadID, kind string) string {
-	if threadID == "" {
-		threadID = "global"
-	}
-	return threadID + ":" + kind
-}
-
-func applyAnswer(r *Review, msg askMsg) {
-	if r.Sessions == nil {
-		r.Sessions = map[string]string{}
-	}
-	if r.Chats == nil {
-		r.Chats = map[string][]Chat{}
-	}
-	key := chatKey(msg.threadID, msg.kind)
-	if msg.sessionID != "" {
-		r.Sessions[key] = msg.sessionID
-	}
-	bubble := msg.answer
-	if msg.err != nil {
-		bubble = "error: " + msg.err.Error()
-	}
-	for i := range r.Threads {
-		t := &r.Threads[i]
-		if t.ID != msg.threadID || msg.err != nil {
-			continue
-		}
-		if msg.kind == "comment" {
-			bubble = "comment updated"
-			if m := commentTag.FindStringSubmatch(msg.answer); m != nil {
-				t.Comment = m[1]
-			} else {
-				bubble = strings.TrimSpace(anyTag.ReplaceAllString(msg.answer, ""))
-			}
-			if m := noteTag.FindStringSubmatch(msg.answer); m != nil {
-				bubble = m[1]
-			}
-		}
-		if m := codeTag.FindStringSubmatch(msg.answer); m != nil {
-			code := strings.TrimRight(strings.TrimLeft(m[1], "\n"), " \t\n")
-			if f := codeFence.FindStringSubmatch(code); f != nil {
-				code = f[1]
-			}
-			t.Code = code
-			if msg.kind != "comment" {
-				bubble = strings.TrimSpace(blankRuns.ReplaceAllString(codeTag.ReplaceAllString(msg.answer, ""), "\n\n"))
-				if bubble == "" {
-					bubble = "comentei no código aqui do lado."
-				}
-			}
-		}
-	}
-	r.Chats[key] = append(r.Chats[key], Chat{"you", msg.prompt}, Chat{"claude", bubble})
-}
-
-func sendCmd(p PR, r Review) tea.Cmd {
-	threads := make([]map[string]any, len(r.Threads))
-	for i, t := range r.Threads {
-		th := map[string]any{"path": t.File, "line": t.HighlightEnd, "side": "RIGHT", "body": t.Comment}
-		if t.HighlightStart < t.HighlightEnd {
-			th["startLine"], th["startSide"] = t.HighlightStart, "RIGHT"
-		}
-		threads[i] = th
-	}
-	return func() tea.Msg {
-		var out any
-		return sentMsg{p.URL, ghGraphQL(sendQuery, map[string]any{"pr": p.ID, "threads": threads}, &out)}
-	}
-}
-
-func prPrompt(p PR, request string, previous []string) string {
-	request = strings.TrimSpace(request)
-	if request == "" {
-		request = "Read the pull request below and tell me how you want to proceed."
-	}
-	body, _ := run("", nil, time.Minute, "gh", "pr", "view", p.URL, "--json", "body", "-q", ".body")
-	parts := append([]string{request, ""}, previous...)
-	parts = append(parts, fmt.Sprintf("# Pull request %s: %s", prKey(p), p.Title), p.URL, "", "## Description", strings.TrimSpace(string(body)))
-	if len(p.Threads) > 0 {
-		parts = append(parts, "", "## Open review threads")
-		for _, t := range p.Threads {
-			parts = append(parts, fmt.Sprintf("- %s:%d @%s: %s", t.Path, t.Line, t.Author, t.Body))
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
 func plural(n int, word string) string {
 	if n == 1 {
 		return "1 " + word
 	}
 	return fmt.Sprintf("%d %ss", n, word)
-}
-
-func saveReview(r *Review) error {
-	if err := os.MkdirAll(reviewsDir, 0o700); err != nil {
-		return err
-	}
-	return writeJSON(reviewFile(r.PRURL), r)
 }
 
 func (m model) currentReview() *Review {
@@ -562,6 +87,9 @@ func (m model) prStatus(p PR) string {
 		parts = append(parts, dim.Render("sent"))
 	case r != nil:
 		parts = append(parts, prStyle.Render(plural(len(r.Threads), "thread")))
+		if r.Skipped > 0 {
+			parts = append(parts, dim.Render(fmt.Sprintf("%d outside the diff, dropped", r.Skipped)))
+		}
 	}
 	return strings.Join(parts, dim.Render(" · "))
 }
@@ -875,7 +403,7 @@ func (m model) teamKey(key, confirm string) (model, tea.Cmd) {
 	case "o":
 		openURL(p.URL)
 	case "r":
-		if m.generating[p.URL] {
+		if m.generating[p.URL] || slices.ContainsFunc(slices.Collect(maps.Keys(m.busy)), func(k string) bool { return strings.HasPrefix(k, p.URL+"|") }) {
 			break
 		}
 		if r != nil && confirm != "r"+p.URL {
@@ -886,7 +414,7 @@ func (m model) teamKey(key, confirm string) (model, tea.Cmd) {
 		return m, generateCmd(p, m.settings.language())
 	case "a", "c", "g":
 		kind := map[string]string{"a": "explanation", "c": "comment", "g": "general"}[key]
-		if r == nil || (t == nil && kind != "general") {
+		if r == nil || (t == nil && kind != "general") || m.generating[p.URL] {
 			break
 		}
 		m.askKind, m.focus = kind, focusAsk
@@ -922,11 +450,11 @@ func (m model) teamKey(key, confirm string) (model, tea.Cmd) {
 func (m model) updateReviews(msg tea.Msg) model {
 	switch msg := msg.(type) {
 	case prsMsg:
-		m.prsLoading = false
-		if msg.err != nil {
-			if m.tab == tabReviews {
-				m.err = msg.err
-			}
+		m.prsLoading, m.prsAt = false, time.Now()
+		if msg.err != nil && m.tab == tabReviews {
+			m.err = msg.err
+		}
+		if msg.prs == nil && msg.err != nil {
 			return m
 		}
 		m.prs, m.labelPool = msg.prs, msg.labels
