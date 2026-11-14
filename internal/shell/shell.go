@@ -19,7 +19,7 @@ func Run(dir string, stdin []byte, timeout time.Duration, name string, args ...s
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "CLAUDECODE=") && !strings.HasPrefix(e, "LINEAR_API_KEY=") {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}

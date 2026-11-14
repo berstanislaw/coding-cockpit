@@ -39,25 +39,25 @@ func ReadEnv(file string) map[string]string {
 	return env
 }
 
-func Load() error {
-	env := ReadEnv(EnvFile)
-	for k, v := range env {
-		if v != "" {
-			os.Setenv(k, v)
-		}
+func Load() (tracker.Client, error) {
+	file := ReadEnv(EnvFile)
+	env := func(k string) string { return file[k] }
+	t, err := tracker.Open(env)
+	for _, name := range tracker.EnvNames() {
+		os.Unsetenv(name)
 	}
-	if err := tracker.Configure(env["TRACKER"], env["JIRA_URL"] != ""); err != nil {
-		return fmt.Errorf("%v · run %s", err, setupCmd)
+	if err != nil {
+		return tracker.Client{}, fmt.Errorf("%v · run %s", err, setupCmd)
 	}
-	if WorkDir = os.Getenv("WORKSPACE_DIR"); WorkDir == "" {
-		return fmt.Errorf("workspace folder missing · run %s", setupCmd)
+	if WorkDir = env("WORKSPACE_DIR"); WorkDir == "" {
+		return tracker.Client{}, fmt.Errorf("workspace folder missing · run %s", setupCmd)
 	}
 	WorkDir = ExpandHome(WorkDir)
 	if !IsDir(WorkDir) {
-		return fmt.Errorf("WORKSPACE_DIR %s is not a folder · run %s", WorkDir, setupCmd)
+		return tracker.Client{}, fmt.Errorf("WORKSPACE_DIR %s is not a folder · run %s", WorkDir, setupCmd)
 	}
 	ClaudeSessionsDir = filepath.Join(Home, ".claude/projects", regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(WorkDir, "-"))
-	return nil
+	return t, nil
 }
 
 func ExpandHome(path string) string {

@@ -8,6 +8,7 @@ import (
 	"kta/internal/config"
 	"kta/internal/shell"
 	"kta/internal/store"
+	"kta/internal/tracker"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -151,17 +152,23 @@ func ticketTopic(text string) string {
 		return ""
 	}
 	_, desc, _ := strings.Cut(text, "\n## Description\n")
-	for _, marker := range []string{"\n## Comments", "\n# Linear ticket ", "\n# Jira ticket ", "\n## kta"} {
+	desc = cutAtTicket(desc)
+	for _, marker := range []string{"\n## Comments", "\n## kta"} {
 		desc, _, _ = strings.Cut(desc, marker)
 	}
 	return clip(strings.Join(titles, " + "), 300) + " — " + clip(desc, 600)
 }
 
 func request(text string) string {
-	for _, marker := range []string{"\n## Previous sessions on this ticket", "\n# Linear ticket ", "\n# Jira ticket "} {
-		text, _, _ = strings.Cut(text, marker)
+	text, _, _ = strings.Cut(text, "\n## Previous sessions on this ticket")
+	return cutAtTicket(text)
+}
+
+func cutAtTicket(s string) string {
+	if loc := nextTicket.FindStringIndex(s); loc != nil {
+		return s[:loc[0]]
 	}
-	return text
+	return s
 }
 
 func clip(s string, n int) string {
@@ -177,8 +184,10 @@ const dailyPrompt = `You write my daily stand-up notes. The input has my Claude 
 Write the summary in %s, even when the sessions are in another language. For each day, write its heading exactly as given in bold (like **%s**) on its own line, followed by a bullet list. One bullet per card or subject, never one per task: merge everything done on the same card or subject that day into a single bullet. Keep each bullet dumb and short, at the level of these examples, saying what the work was about and not the details of what was done: %s. Describe the subject so anyone on the team understands it: never write ticket identifiers (like KAN-123), session names, people, file paths, ids, URLs, keys or commit hashes. Leave out sessions where nothing real happened, like tests and quick questions. Reply with only the headings and bullets.`
 
 var (
-	ticketHeader = regexp.MustCompile(`(?m)^# (?:Linear|Jira) ticket \S+: (.+)$`)
-	secrets      = regexp.MustCompile(`\b(lin_api|sk-ant|ghp|gho|github_pat|xox[abp])[-_A-Za-z0-9]{8,}`)
+	trackerNames = strings.Join(tracker.Names(), "|")
+	ticketHeader = regexp.MustCompile(`(?m)^# (?:` + trackerNames + `) ticket \S+: (.+)$`)
+	nextTicket   = regexp.MustCompile(`\n# (?:` + trackerNames + `) ticket `)
+	secrets      = regexp.MustCompile(`\b(lin_api|ATATT|ATTA|sk-ant|ghp|gho|github_pat|xox[abp])[-_A-Za-z0-9=]{8,}`)
 )
 
 type Msg struct {

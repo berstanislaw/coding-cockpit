@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -48,10 +49,7 @@ func TestPRs(t *testing.T) {
 			t.Errorf("prLabel(%s) = %s, want %s", c.url, got, c.label)
 		}
 	}
-	var i tracker.Issue
-	for _, u := range []string{"https://github.com/acme/api/pull/1/files", "https://linear.app/x", "https://github.com/acme/web/pull/2"} {
-		i.Attachments.Nodes = append(i.Attachments.Nodes, struct{ URL string }{u})
-	}
+	i := tracker.Issue{Links: []string{"https://github.com/acme/api/pull/1/files", "https://linear.app/x", "https://github.com/acme/web/pull/2"}}
 	want := []string{"https://github.com/acme/api/pull/1", "https://github.com/acme/web/pull/2"}
 	if got := issuePRs(i); !slices.Equal(got, want) {
 		t.Errorf("issuePRs = %v, want %v", got, want)
@@ -89,8 +87,8 @@ func TestSettings(t *testing.T) {
 }
 
 func TestBuildColumns(t *testing.T) {
-	issue := func(key, state, typ string, pos, prio float64) tracker.Issue {
-		i := tracker.Issue{Identifier: key, Priority: prio, UpdatedAt: key}
+	issue := func(key, state, typ string, pos float64, prio int) tracker.Issue {
+		i := tracker.Issue{Key: key, Priority: prio, UpdatedAt: stamp(key)}
 		i.State = tracker.State{Name: state, Type: typ, Position: pos}
 		return i
 	}
@@ -114,7 +112,7 @@ func TestBuildColumns(t *testing.T) {
 	if !slices.Equal(got, []string{"todo", "doing", "review"}) {
 		t.Fatalf("columns = %v", got)
 	}
-	if first := m.cols[1].items[0].Identifier; first != "A-4" {
+	if first := m.cols[1].items[0].Key; first != "A-4" {
 		t.Errorf("a ticket with a running session should come first, got %s", first)
 	}
 }
@@ -158,7 +156,7 @@ func TestMarquee(t *testing.T) {
 }
 
 func todo(key string) tracker.Issue {
-	i := tracker.Issue{Identifier: key, UpdatedAt: key}
+	i := tracker.Issue{Key: key, UpdatedAt: stamp(key)}
 	i.State = tracker.State{Name: "todo", Type: "unstarted"}
 	return i
 }
@@ -181,13 +179,13 @@ func TestGroups(t *testing.T) {
 	if got := m.titleOf("gs"); got != "A-1+A-2+A-3 · together" {
 		t.Errorf("titleOf = %q", got)
 	}
-	m.ticket = &tracker.Issue{Identifier: "A-2"}
+	m.ticket = &tracker.Issue{Key: "A-2"}
 	if got := m.listSessions(); len(got) != 2 || got[0].ID != "solo" || got[1].ID != "gs" {
 		t.Errorf("a ticket panel lists its own and its group's sessions, newest first: %+v", got)
 	}
 	var order []string
 	for _, i := range m.cols[0].items {
-		order = append(order, i.Identifier)
+		order = append(order, i.Key)
 	}
 	if !slices.Equal(order, []string{"A-3", "A-2", "A-1", "B-9", "B-8"}) {
 		t.Errorf("group members should sit together: %v", order)
@@ -233,7 +231,7 @@ func TestFold(t *testing.T) {
 	ids := func() []string {
 		var out []string
 		for _, i := range m.cols[0].items {
-			out = append(out, i.Identifier)
+			out = append(out, i.Key)
 		}
 		return out
 	}
@@ -273,13 +271,13 @@ func TestFoldSurvivesFinishedTicket(t *testing.T) {
 	m := loaded(t, todo("A-1"), todo("A-2"))
 	m.forget([]string{"A-3"})
 	m.buildColumns()
-	if len(m.cols[0].items) != 1 || len(m.collapsed[m.cols[0].items[0].Identifier].issues) != 2 {
+	if len(m.cols[0].items) != 1 || len(m.collapsed[m.cols[0].items[0].Key].issues) != 2 {
 		t.Errorf("the group should stay folded after one ticket finishes: %v", m.cols[0].items)
 	}
 }
 
 func TestKtaArgs(t *testing.T) {
-	m := model{groups: []store.Group{{ID: "g1", Tickets: []string{"A-1", "A-2"}}}, sessions: map[string][]store.Session{store.GroupKey("g1"): {{ID: "s1"}}, "A-1": {{ID: "s2"}}}, linearPRs: map[string][]string{"A-2": {"https://github.com/acme/api/pull/7"}}}
+	m := model{groups: []store.Group{{ID: "g1", Tickets: []string{"A-1", "A-2"}}}, sessions: map[string][]store.Session{store.GroupKey("g1"): {{ID: "s1"}}, "A-1": {{ID: "s2"}}}, ticketPRs: map[string][]string{"A-2": {"https://github.com/acme/api/pull/7"}}}
 	if m.ktaArgs("", nil) != nil {
 		t.Error("a session without tickets gets nothing")
 	}
@@ -437,8 +435,8 @@ func TestWizard(t *testing.T) {
 	if info, _ := os.Stat(config.EnvFile); info.Mode().Perm() != 0o600 {
 		t.Errorf("env mode = %v", info.Mode().Perm())
 	}
-	if err := config.Load(); err != nil || tracker.Kind != "jira" || tracker.JiraURL != "https://acme.atlassian.net" {
-		t.Errorf("loadConfig after the wizard: %v, tracker %s", err, tracker.Kind)
+	if opened, err := config.Load(); err != nil || opened.Key != "jira" || os.Getenv("JIRA_API_TOKEN") != "" {
+		t.Errorf("loadConfig after the wizard opens Jira and keeps the token out of the environment: %v, tracker %s", err, opened.Key)
 	}
 	edit := press(newWizard(env), "enter")
 	if edit.choice != 1 || edit.inputs[0].Value() != "acme.atlassian.net" || edit.inputs[1].Value() != "me@acme.com" || edit.inputs[2].Value() != "" {
@@ -454,14 +452,13 @@ func TestWizard(t *testing.T) {
 	if got := edit.env(); got["TRACKER"] != "linear" || got["LINEAR_API_KEY"] != "lin_api_new" || got["JIRA_API_TOKEN"] != "" {
 		t.Errorf("switching to Linear drops the Jira credentials: %v", got)
 	}
-	tracker.Kind = "linear"
 }
 
 func TestEveryStatus(t *testing.T) {
 	testenv.UseTemp(t)
 	store.WriteJSON(config.SessionsFile, map[string][]store.Session{"A-2": {{ID: "old"}, {ID: "running"}}, "A-1": {{ID: "keep"}}})
-	done := tracker.Issue{Identifier: "A-2", State: tracker.State{Name: "Done", Type: "completed"}}
-	doing := tracker.Issue{Identifier: "A-1", State: tracker.State{Name: "Doing", Type: "started", Position: 2}}
+	done := tracker.Issue{Key: "A-2", State: tracker.State{Name: "Done", Type: "completed"}}
+	doing := tracker.Issue{Key: "A-1", State: tracker.State{Name: "Doing", Type: "started", Position: 2}}
 	m := loaded(t, doing, done)
 	m.live["running"] = "%1"
 	m.ta = textarea.New()
@@ -492,4 +489,8 @@ func TestHelpers(t *testing.T) {
 	if hueColor(0) == hueColor(180) {
 		t.Error("hueColor should change with the hue")
 	}
+}
+
+func stamp(key string) time.Time {
+	return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(key[0])*time.Hour + time.Duration(key[len(key)-1])*time.Minute)
 }

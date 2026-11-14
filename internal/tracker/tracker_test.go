@@ -7,11 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestJiraSite(t *testing.T) {
 	for in, want := range map[string]string{"acme": "https://acme.atlassian.net", "acme.atlassian.net": "https://acme.atlassian.net", " https://acme.atlassian.net/jira/software/projects/KAN/boards/1 ": "https://acme.atlassian.net", "http://jira.local:8080/": "http://jira.local:8080", "": ""} {
-		if got := JiraSite(in); got != want {
+		if got := jiraSite(in); got != want {
 			t.Errorf("jiraSite(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -61,13 +62,11 @@ func TestJiraClient(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	oldURL, oldEmail, oldToken := JiraURL, JiraEmail, JiraToken
-	t.Cleanup(func() { JiraURL, JiraEmail, JiraToken = oldURL, oldEmail, oldToken })
-	JiraURL, JiraEmail, JiraToken = srv.URL, "me@acme.com", "tok"
-	if name, err := JiraMyself(); err != nil || name != "Ana Lima" {
+	j := jira{srv.URL, "me@acme.com", "tok"}
+	if name, err := j.Me(); err != nil || name != "Ana Lima" {
 		t.Fatalf("jiraMyself = %q, %v", name, err)
 	}
-	issues, err := jiraBoard([]string{"assigned", "created"})
+	issues, err := j.Board([]string{"assigned", "created"})
 	if err != nil || len(issues) != 2 {
 		t.Fatalf("jiraBoard = %+v, %v", issues, err)
 	}
@@ -75,21 +74,133 @@ func TestJiraClient(t *testing.T) {
 		t.Errorf("jql = %q", queries[0])
 	}
 	first := issues[0]
-	if first.State.Type != "started" || first.State.Name != "In Progress" || first.Priority != 2 || first.URL != srv.URL+"/browse/KAN-1" || first.Team.Key != "KAN" || first.Labels.Nodes[0].Name != "api" {
+	if first.State.Type != "started" || first.State.Name != "In Progress" || first.Priority != 2 || first.URL != srv.URL+"/browse/KAN-1" || first.Team != "KAN" || first.Labels[0] != "api" {
 		t.Errorf("mapped issue = %+v", first)
 	}
 	if issues[1].State.Type != "unstarted" || issues[1].Priority != 0 {
 		t.Errorf("second issue = %+v", issues[1])
 	}
-	detail, err := jiraIssueDetail("KAN-1")
-	if err != nil || detail.Description != "Do it" || len(detail.Comments.Nodes) != 1 || detail.Comments.Nodes[0].User.Name != "Bia" || detail.Comments.Nodes[0].Body != "ok" {
+	detail, err := j.Issue("KAN-1")
+	if err != nil || detail.Description != "Do it" || len(detail.Comments) != 1 || detail.Comments[0].Author != "Bia" || detail.Comments[0].Body != "ok" || detail.Comments[0].CreatedAt.Format(time.RFC3339) != "2026-11-13T10:00:00-03:00" {
 		t.Errorf("detail = %+v, %v", detail, err)
 	}
-	if _, err := jiraIssueDetail("KAN-404"); err == nil || !strings.Contains(err.Error(), "Issue does not exist") {
+	if _, err := j.Issue("KAN-404"); err == nil || !strings.Contains(err.Error(), "Issue does not exist") {
 		t.Errorf("missing issue error = %v", err)
 	}
-	JiraToken = "wrong"
-	if _, err := JiraMyself(); err == nil || !strings.Contains(err.Error(), "didn't accept") {
+	j.token = "wrong"
+	if _, err := j.Me(); err == nil || !strings.Contains(err.Error(), "didn't accept") {
 		t.Errorf("bad token error = %v", err)
+	}
+}
+
+func TestTrelloClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != `OAuth oauth_consumer_key="k", oauth_token="t"` {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, "invalid token")
+			return
+		}
+		list := map[string]string{"open": `{"name":"Doing","pos":2}`, "done": `{"name":"Done","pos":3}`, "archived": `{"name":"Old","pos":1,"closed":true}`}
+		switch r.URL.Path {
+		case "/1/members/me":
+			fmt.Fprint(w, `{"fullName":"Ana Lima"}`)
+		case "/1/members/me/boards":
+			fmt.Fprint(w, `[{"id":"b1","name":"Shop","lists":[{"id":"l1","name":"Doing","pos":2},{"id":"l2","name":"Done","pos":3}]}]`)
+		case "/1/members/me/cards":
+			fmt.Fprint(w, `[{"name":"First","shortLink":"aaaa1111","shortUrl":"https://trello.com/c/aaaa1111","idBoard":"b1","idList":"l1","labels":[{"name":"api"},{"name":""}]},{"name":"Second","shortLink":"bbbb2222","idBoard":"b1","idList":"l2"},{"name":"Hidden","shortLink":"cccc3333","idBoard":"b9","idList":"l9"}]`)
+		case "/1/cards/aaaa1111":
+			fmt.Fprint(w, `{"name":"First","desc":"Do it","shortLink":"aaaa1111","list":`+list["open"]+`,"board":{"name":"Shop"},"actions":[{"date":"2026-11-14T10:00:00.000Z","data":{"text":"second"},"memberCreator":{"fullName":"Bia"}},{"date":"2026-11-13T10:00:00.000Z","data":{"text":"first"},"memberCreator":{"fullName":"Caio"}}]}`)
+		case "/1/cards/bbbb2222":
+			fmt.Fprint(w, `{"list":`+list["done"]+`}`)
+		case "/1/cards/cccc3333":
+			fmt.Fprint(w, `{"list":`+list["archived"]+`}`)
+		case "/1/cards/eeee5555":
+			fmt.Fprint(w, `{"closed":true,"list":`+list["open"]+`}`)
+		case "/1/cards/ffff6666":
+			fmt.Fprint(w, `{"list":`+list["open"]+`}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "The requested resource was not found.")
+		}
+	}))
+	defer srv.Close()
+	tr := trello{srv.URL + "/1", "k", "t"}
+	if name, err := tr.Me(); err != nil || name != "Ana Lima" {
+		t.Fatalf("trelloMyself = %q, %v", name, err)
+	}
+	issues, err := tr.Board([]string{"assigned"})
+	if err != nil || len(issues) != 2 {
+		t.Fatalf("board = %+v, %v", issues, err)
+	}
+	first := issues[0]
+	if first.Key != "aaaa1111" || first.State.Name != "Doing" || first.State.Type != "started" || first.Team != "Shop" || first.URL != "https://trello.com/c/aaaa1111" || len(first.Labels) != 1 {
+		t.Errorf("mapped card = %+v", first)
+	}
+	if issues[1].State.Type != "completed" {
+		t.Errorf("a card in a Done list is completed: %+v", issues[1].State)
+	}
+	detail, err := tr.Issue("aaaa1111")
+	if err != nil || detail.Description != "Do it" || detail.Team != "Shop" || len(detail.Comments) != 2 || detail.Comments[0].Body != "first" || detail.Comments[0].CreatedAt.Day() != 13 || detail.Comments[1].Author != "Bia" {
+		t.Errorf("detail = %+v, %v", detail, err)
+	}
+	done, _ := tr.Done([]string{"bbbb2222", "cccc3333", "dddd4444", "eeee5555", "ffff6666", "KAN-1"})
+	if strings.Join(done, ",") != "bbbb2222,cccc3333,dddd4444,eeee5555" {
+		t.Errorf("done = %v", done)
+	}
+	if states, err := tr.States([]string{"Shop"}); err != nil || len(states) != 2 || states[1].Type != "completed" {
+		t.Errorf("states = %+v, %v", states, err)
+	}
+	if _, err := tr.Issue("dddd4444"); err == nil || Retryable(err) {
+		t.Errorf("a missing card is an error you can't retry away: %v", err)
+	}
+	if trelloKind.Supports("created") || !trelloKind.Supports("assigned") {
+		t.Error("Trello boards only show the cards you're a member of")
+	}
+	tr.token = "wrong"
+	if _, err := tr.Me(); err == nil || !strings.Contains(err.Error(), "didn't accept") {
+		t.Errorf("bad token error = %v", err)
+	}
+}
+
+func TestOpen(t *testing.T) {
+	env := map[string]string{"JIRA_URL": "acme", "JIRA_EMAIL": "me@acme.com", "JIRA_API_TOKEN": "tok"}
+	get := func(k string) string { return env[k] }
+	if c, err := Open(get); err != nil || c.Key != "jira" || c.backend.(jira).url != "https://acme.atlassian.net" {
+		t.Errorf("an old config with JIRA_URL and no TRACKER opens Jira: %v %+v", err, c)
+	}
+	env["TRACKER"] = "trello"
+	if _, err := Open(get); err == nil || err.Error() != "Trello: API key is missing" {
+		t.Errorf("a missing field fails: %v", err)
+	}
+	env["TRACKER"] = "asana"
+	if _, err := Open(get); err == nil || !strings.Contains(err.Error(), "linear, jira, trello") {
+		t.Errorf("unknown tracker error = %v", err)
+	}
+}
+
+func TestLinearIssue(t *testing.T) {
+	var n linearIssue
+	json.Unmarshal([]byte(`{"identifier":"ENG-1","updatedAt":"2026-11-14T09:30:00.000Z","priority":2,"state":{"name":"Doing","type":"started","position":3},"team":{"key":"ENG"},"labels":{"nodes":[{"name":"api"}]},"comments":{"nodes":[{"body":"bot","createdAt":"2026-11-13T09:00:00.000Z"},{"body":"hi","createdAt":"2026-11-13T08:00:00.000Z","user":{"name":"Bia"}}]},"attachments":{"nodes":[{"url":"https://github.com/acme/shop/pull/7"}]}}`), &n)
+	i := n.issue()
+	if i.Key != "ENG-1" || i.Priority != 2 || i.State.Type != Started || i.Team != "ENG" || i.Labels[0] != "api" || i.Links[0] != "https://github.com/acme/shop/pull/7" {
+		t.Errorf("linear issue = %+v", i)
+	}
+	if i.UpdatedAt.Hour() != 9 || i.Comments[0].CreatedAt.Day() != 13 {
+		t.Errorf("linear times = %v %v", i.UpdatedAt, i.Comments[0].CreatedAt)
+	}
+	if i.Comments[0].Author != "Bia" || i.Comments[1].Author != "integration" {
+		t.Errorf("comments = %+v", i.Comments)
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	_, err := trello{srv.URL, "k", "t"}.Me()
+	if !Retryable(err) || !strings.HasPrefix(err.Error(), "can't reach Trello") {
+		t.Errorf("an unreachable tracker can be retried: %v", err)
+	}
+	if Retryable(statusError{500, "jira 500"}) {
+		t.Error("an answer from the tracker isn't a network failure")
 	}
 }

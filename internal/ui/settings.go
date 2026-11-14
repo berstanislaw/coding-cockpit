@@ -27,18 +27,18 @@ func toggle(list []string, v string) []string {
 func teamKeys(issues []tracker.Issue) []string {
 	var teams []string
 	for _, i := range issues {
-		if !slices.Contains(teams, i.Team.Key) {
-			teams = append(teams, i.Team.Key)
+		if !slices.Contains(teams, i.Team) {
+			teams = append(teams, i.Team)
 		}
 	}
 	slices.Sort(teams)
 	return teams
 }
 
-func statesCmd(issues []tracker.Issue) tea.Cmd {
-	teams := teamKeys(issues)
+func (m model) statesCmd(issues []tracker.Issue) tea.Cmd {
+	t, teams := m.tracker, teamKeys(issues)
 	return func() tea.Msg {
-		states, err := tracker.FetchStates(teams)
+		states, err := t.States(teams)
 		if err != nil {
 			return nil
 		}
@@ -90,6 +90,9 @@ func (m model) settingItems() []settingItem {
 		}})
 	}
 	for _, src := range tracker.Sources {
+		if !m.tracker.Supports(src.Key) {
+			continue
+		}
 		items = append(items, settingItem{"Tickets", check(slices.Contains(m.settings.Sources(), src.Key), src.Label), func(s *store.Settings, dir int) {
 			if t := toggle(s.Sources(), src.Key); dir == 0 && len(t) > 0 {
 				s.Tickets = t
@@ -165,7 +168,7 @@ func (m model) applySettings(next store.Settings) (model, tea.Cmd) {
 	}
 	if !slices.Equal(next.Sources(), before.Sources()) {
 		m.loading = true
-		return m, loadBoardCmd(next.Sources())
+		return m, m.loadBoardCmd(next.Sources())
 	}
 	return m, nil
 }

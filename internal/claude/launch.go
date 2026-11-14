@@ -5,6 +5,7 @@ import (
 	"kta/internal/config"
 	"kta/internal/shell"
 	"kta/internal/tmux"
+	"kta/internal/tracker"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ func Launch(id, title string, args ...string) (string, error) {
 	for _, a := range append([]string{"--settings", hookSettings(id, title)}, args...) {
 		cmd = append(cmd, shell.Quote(a))
 	}
-	script := "unset CLAUDECODE\nrm -f -- \"$0\"\nunset LINEAR_API_KEY JIRA_URL JIRA_EMAIL JIRA_API_TOKEN TRACKER\nset -a\n. " + shell.Quote(config.EnvFile) + "\nset +a\nexport KTA_WORKSPACE=" + shell.Quote(config.Workspace) + " KTA_SESSION=" + shell.Quote(id) + "\n" + strings.Join(cmd, " ") + "\n"
+	script := "unset CLAUDECODE\nrm -f -- \"$0\"\nunset " + strings.Join(tracker.EnvNames(), " ") + " TRACKER\nset -a\n. " + shell.Quote(config.EnvFile) + "\nset +a\nexport KTA_WORKSPACE=" + shell.Quote(config.Workspace) + " KTA_SESSION=" + shell.Quote(id) + "\n" + strings.Join(cmd, " ") + "\n"
 	file := filepath.Join(config.RunDir, id+".sh")
 	if err := os.WriteFile(file, []byte(script), 0o600); err != nil {
 		return "", err

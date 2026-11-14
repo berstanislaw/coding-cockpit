@@ -39,8 +39,8 @@ func TestDailyParsing(t *testing.T) {
 }
 
 func TestGroupPrompt(t *testing.T) {
-	a, b := tracker.Issue{Identifier: "A-1", Title: "Import sheets", Description: "upload"}, tracker.Issue{Identifier: "A-2", Title: "Export sheets"}
-	p := claude.BuildPrompt([]tracker.Issue{a, b}, "", nil)
+	a, b := tracker.Issue{Key: "A-1", Title: "Import sheets", Description: "upload"}, tracker.Issue{Key: "A-2", Title: "Export sheets"}
+	p := claude.BuildPrompt(tracker.All[0], []tracker.Issue{a, b}, "", nil)
 	for _, want := range []string{"Read the tickets below", "These 2 tickets are one piece of work", "# Linear ticket A-1: Import sheets", "# Linear ticket A-2: Export sheets"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("group prompt misses %q", want)
@@ -52,3 +52,11 @@ func TestGroupPrompt(t *testing.T) {
 }
 
 func TestMain(m *testing.M) { testenv.Main(m) }
+
+func TestSecretsAreScrubbed(t *testing.T) {
+	in := "linear lin_api_abc12345 jira ATATT3xFfGF0Tk-9_x= trello ATTA0123456789abcdef keep ATTACK and Atlassian"
+	want := "linear [secret] jira [secret] trello [secret] keep ATTACK and Atlassian"
+	if got := secrets.ReplaceAllString(in, "[secret]"); got != want {
+		t.Errorf("scrubbed = %q", got)
+	}
+}

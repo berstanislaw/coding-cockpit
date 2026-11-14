@@ -19,11 +19,11 @@ func TestRunGroup(t *testing.T) {
 		if key == "A-404" {
 			return tracker.Issue{}, errors.New("not found")
 		}
-		return tracker.Issue{Identifier: key, Title: "title of " + key, Description: "details of " + key}, nil
+		return tracker.Issue{Key: key, Title: "title of " + key, Description: "details of " + key}, nil
 	}
 	run := func(session string, args ...string) (string, error) {
 		var out strings.Builder
-		err := runGroup(session, args, fetch, &out)
+		err := runGroup(session, args, tracker.All[0], fetch, &out)
 		return out.String(), err
 	}
 	if _, err := run(""); err == nil {

@@ -38,7 +38,7 @@ func (m model) switchTab(t tab) model {
 	case tabKanban:
 		m.focus = focusBoard
 		if m.ticket != nil {
-			pane = m.bestPane(m.ticket.Identifier)
+			pane = m.bestPane(m.ticket.Key)
 		}
 	case tabSessions:
 		pane = m.bestPane(store.FreeKey)
@@ -93,7 +93,7 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 		m = m.switchTab(t)
 		switch {
 		case m.tab == tabSettings:
-			return m, tea.Batch(statesCmd(m.issues), github.PRsCmd(m.settings.ReviewLabels))
+			return m, tea.Batch(m.statesCmd(m.issues), github.PRsCmd(m.settings.ReviewLabels))
 		case m.tab == tabReviews && time.Since(m.prsAt) > time.Minute:
 			m.prsLoading = true
 			return m, github.PRsCmd(m.settings.ReviewLabels)
@@ -157,15 +157,15 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 		return m.openTicket(false)
 	case "n":
 		m.newIn = ""
-		if i := m.selectedIssue(); i != nil && len(m.collapsed[i.Identifier].issues) > 1 {
-			m.newIn = m.collapsed[i.Identifier].ID
+		if i := m.selectedIssue(); i != nil && len(m.collapsed[i.Key].issues) > 1 {
+			m.newIn = m.collapsed[i.Key].ID
 		}
 		return m.openTicket(true)
 	case "z", "Z":
 		return m.foldKey(key)
 	case "g", "G":
 		if i := m.selectedIssue(); i != nil {
-			m.marked = toggle(m.marked, i.Identifier)
+			m.marked = toggle(m.marked, i.Key)
 		}
 	case "p":
 		if i := m.selectedIssue(); i != nil {
@@ -186,7 +186,7 @@ func (m model) handleKey(k tea.KeyMsg) (model, tea.Cmd) {
 		return m, m.search.Focus()
 	case "r":
 		m.loading = true
-		return m, loadBoardCmd(m.settings.Sources())
+		return m, m.loadBoardCmd(m.settings.Sources())
 	case "o":
 		if i := m.selectedIssue(); i != nil {
 			shell.OpenURL(i.URL)
@@ -233,7 +233,7 @@ func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 		return m, m.startNew()
 	case "p":
 		if inTicket {
-			m.openPRs(m.ticket.Identifier)
+			m.openPRs(m.ticket.Key)
 		}
 	case "o":
 		if inTicket {
@@ -241,7 +241,7 @@ func (m model) stripKey(key, confirm string) (model, tea.Cmd) {
 		}
 	case "r":
 		if inTicket {
-			return m, loadDetailCmd(m.ticket.Identifier)
+			return m, m.loadDetailCmd(m.ticket.Key)
 		}
 	case "enter":
 		if pr != "" {
@@ -313,7 +313,7 @@ func (m model) keyHelp() []keyHelp {
 		return []keyHelp{{"enter", "show / open PR", true}, {"n", "new session", true}, {"p", "open PRs", true}, {"↑↓", "select", false}, {"o", "open in browser", false}, stop, remove, {"pgup/pgdn", "scroll the ticket", false}, {"r", "reload the ticket", false}, {"alt+↑ / esc", "back to the kanban", false}, claude, tabs, quit}
 	}
 	marks := len(m.marked)
-	keys := []keyHelp{{"enter", "open", marks == 0}, {"n", "new session", marks == 0}, {"/", "search", marks == 0}, {"←→↑↓", "move", false}, {"g", "mark cards to work on together", false}, {"z / Z", "fold or unfold the group / all groups", false}, {"p", "open PRs", false}, {"o", "open in browser", false}, {"r", "refresh", false}}
+	keys := []keyHelp{{"enter", "open", marks == 0}, {"n", "new session", marks == 0}, {"/", "search", marks == 0}, {"←→↑↓", "move", false}, {"g", "mark cards to work on together", false}, {"z / Z", "fold or unfold the group / all groups", false}, {"p", "open PRs", false}, {"o", "open in browser", false}, {"r", "refresh / retry", false}}
 	if marks > 0 {
 		group := []keyHelp{{"g", "mark / unmark", true}}
 		if marks > 1 {

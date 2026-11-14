@@ -6,14 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
-func JiraSite(s string) string {
+func jiraSite(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
@@ -31,8 +31,8 @@ func JiraSite(s string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-func jiraDo(method, path string, body, out any) error {
-	if JiraURL == "" {
+func (j jira) do(method, path string, body, out any) error {
+	if j.url == "" {
 		return errors.New("JIRA_URL is missing")
 	}
 	var in io.Reader
@@ -43,22 +43,18 @@ func jiraDo(method, path string, body, out any) error {
 		}
 		in = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, JiraURL+path, in)
+	req, err := http.NewRequest(method, j.url+path, in)
 	if err != nil {
 		return err
 	}
-	req.SetBasicAuth(JiraEmail, JiraToken)
+	req.SetBasicAuth(j.email, j.token)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := httpClient.Do(req)
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return fmt.Errorf("Jira didn't respond in %s · press r to retry", httpClient.Timeout)
-	}
+	res, err := send("Jira", req)
 	if err != nil {
-		return fmt.Errorf("can't reach %s (%v)", JiraURL, errors.Unwrap(err))
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
@@ -75,9 +71,9 @@ func jiraDo(method, path string, body, out any) error {
 			msgs = append(msgs, m)
 		}
 		if len(msgs) == 0 {
-			return fmt.Errorf("jira %d at %s", res.StatusCode, JiraURL)
+			return statusError{res.StatusCode, fmt.Sprintf("jira %d at %s", res.StatusCode, j.url)}
 		}
-		return fmt.Errorf("jira %d: %s", res.StatusCode, strings.Join(msgs, "; "))
+		return statusError{res.StatusCode, fmt.Sprintf("jira %d: %s", res.StatusCode, strings.Join(msgs, "; "))}
 	}
 	if out == nil {
 		return nil
@@ -91,20 +87,21 @@ func jiraState(s jiraStatus) State {
 	return st
 }
 
-func (j jiraIssue) issue() Issue {
-	f := j.Fields
-	i := Issue{Identifier: j.Key, Title: f.Summary, URL: JiraURL + "/browse/" + j.Key, UpdatedAt: f.Updated, Description: adfMarkdown(f.Description), State: jiraState(f.Status)}
+func (ji jiraIssue) issue(site string) Issue {
+	f := ji.Fields
+	i := Issue{Key: ji.Key, Title: f.Summary, URL: site + "/browse/" + ji.Key, UpdatedAt: jiraTime(f.Updated), Description: adfMarkdown(f.Description), State: jiraState(f.Status), Team: f.Project.Key, Labels: f.Labels}
 	if f.Priority != nil {
 		i.Priority = jiraPriority[f.Priority.Name]
 	}
-	i.Team.Key = f.Project.Key
-	for _, l := range f.Labels {
-		i.Labels.Nodes = append(i.Labels.Nodes, struct{ Name, Color string }{l, ""})
-	}
 	for _, c := range f.Comment.Comments {
-		i.Comments.Nodes = append(i.Comments.Nodes, Comment{Body: adfMarkdown(c.Body), CreatedAt: c.Created, User: &struct{ Name string }{c.Author.DisplayName}})
+		i.Comments = append(i.Comments, Comment{Author: c.Author.DisplayName, Body: adfMarkdown(c.Body), CreatedAt: jiraTime(c.Created)})
 	}
 	return i
+}
+
+func jiraTime(s string) time.Time {
+	t, _ := time.Parse("2006-01-02T15:04:05.000-0700", s)
+	return t
 }
 
 func jiraJQL(sources []string) string {
@@ -117,7 +114,7 @@ func jiraJQL(sources []string) string {
 	return "(" + strings.Join(who, " OR ") + ") ORDER BY updated DESC"
 }
 
-func jiraSearch(jql string) ([]jiraIssue, error) {
+func (j jira) search(jql string) ([]jiraIssue, error) {
 	var all []jiraIssue
 	token := ""
 	for {
@@ -129,7 +126,7 @@ func jiraSearch(jql string) ([]jiraIssue, error) {
 			Issues        []jiraIssue
 			NextPageToken string
 		}
-		if err := jiraDo("POST", "/rest/api/3/search/jql", body, &page); err != nil {
+		if err := j.do("POST", "/rest/api/3/search/jql", body, &page); err != nil {
 			return nil, err
 		}
 		all = append(all, page.Issues...)
@@ -140,27 +137,27 @@ func jiraSearch(jql string) ([]jiraIssue, error) {
 	}
 }
 
-func jiraBoard(sources []string) ([]Issue, error) {
-	found, err := jiraSearch(jiraJQL(sources))
+func (j jira) Board(sources []string) ([]Issue, error) {
+	found, err := j.search(jiraJQL(sources))
 	if err != nil {
 		return nil, err
 	}
 	issues := make([]Issue, len(found))
-	for k, j := range found {
-		issues[k] = j.issue()
+	for k, ji := range found {
+		issues[k] = ji.issue(j.url)
 	}
 	return issues, nil
 }
 
-func jiraIssueDetail(key string) (Issue, error) {
-	var j jiraIssue
-	if err := jiraDo("GET", "/rest/api/3/issue/"+url.PathEscape(key)+"?fields="+jiraFields+",description,comment", nil, &j); err != nil {
+func (j jira) Issue(key string) (Issue, error) {
+	var ji jiraIssue
+	if err := j.do("GET", "/rest/api/3/issue/"+url.PathEscape(key)+"?fields="+jiraFields+",description,comment", nil, &ji); err != nil {
 		return Issue{}, err
 	}
-	return j.issue(), nil
+	return ji.issue(j.url), nil
 }
 
-func jiraDone(keys []string) ([]string, error) {
+func (j jira) Done(keys []string) ([]string, error) {
 	var valid []string
 	for _, k := range keys {
 		if jiraKey.MatchString(k) {
@@ -170,31 +167,31 @@ func jiraDone(keys []string) ([]string, error) {
 	if len(valid) == 0 {
 		return nil, nil
 	}
-	found, err := jiraSearch("key in (" + strings.Join(valid, ", ") + ") AND statusCategory = Done")
+	found, err := j.search("key in (" + strings.Join(valid, ", ") + ") AND statusCategory = Done")
 	if err == nil {
 		done := make([]string, len(found))
-		for k, j := range found {
-			done[k] = j.Key
+		for k, ji := range found {
+			done[k] = ji.Key
 		}
 		return done, nil
 	}
 	var done []string
 	for _, k := range valid {
-		var j jiraIssue
-		err := jiraDo("GET", "/rest/api/3/issue/"+k+"?fields=status", nil, &j)
-		if (err != nil && strings.Contains(err.Error(), "jira 404")) || (err == nil && j.Fields.Status.StatusCategory.Key == "done") {
+		var ji jiraIssue
+		err := j.do("GET", "/rest/api/3/issue/"+k+"?fields=status", nil, &ji)
+		if notFound(err) || (err == nil && ji.Fields.Status.StatusCategory.Key == "done") {
 			done = append(done, k)
 		}
 	}
 	return done, nil
 }
 
-func jiraStates(projects []string) ([]State, error) {
+func (j jira) States(projects []string) ([]State, error) {
 	var out []State
 	seen := map[string]bool{}
 	for _, p := range projects {
 		var types []struct{ Statuses []jiraStatus }
-		if err := jiraDo("GET", "/rest/api/3/project/"+url.PathEscape(p)+"/statuses", nil, &types); err != nil {
+		if err := j.do("GET", "/rest/api/3/project/"+url.PathEscape(p)+"/statuses", nil, &types); err != nil {
 			return nil, err
 		}
 		for _, t := range types {
@@ -211,20 +208,36 @@ func jiraStates(projects []string) ([]State, error) {
 	return out, nil
 }
 
-func JiraMyself() (string, error) {
+func (j jira) Me() (string, error) {
 	var me struct{ DisplayName string }
-	err := jiraDo("GET", "/rest/api/3/myself", nil, &me)
+	err := j.do("GET", "/rest/api/3/myself", nil, &me)
 	return me.DisplayName, err
 }
 
-var (
-	JiraURL, JiraEmail, JiraToken string
+var jiraKind = Kind{
+	Key:     "jira",
+	Name:    "Jira",
+	About:   "Jira Cloud, with your email and an API token",
+	Team:    "Project",
+	APIHint: "To read or change tickets, use the Jira Cloud REST API v3 at $JIRA_URL/rest/api/3 with basic auth $JIRA_EMAIL:$JIRA_API_TOKEN; moving a ticket to another status goes through GET and POST /rest/api/3/issue/<key>/transitions.",
+	Fields: []Field{
+		{Env: "JIRA_URL", Label: "Site", Hint: "the address of your Jira, like acme.atlassian.net (acme works too)", Placeholder: "acme.atlassian.net", clean: jiraSite},
+		{Env: "JIRA_EMAIL", Label: "Email", Hint: "the email you sign in to Atlassian with"},
+		{Env: "JIRA_API_TOKEN", Label: "API token", Hint: "id.atlassian.com → Security → Create and manage API tokens", Secret: true},
+	},
+	open: func(env map[string]string) backend {
+		return jira{env["JIRA_URL"], env["JIRA_EMAIL"], env["JIRA_API_TOKEN"]}
+	},
+}
 
-	jiraPriority = map[string]float64{"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 4}
+type jira struct{ url, email, token string }
+
+var (
+	jiraPriority = map[string]int{"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 4}
 	jiraCategory = map[string]State{
-		"new":           {Type: "unstarted", Color: "#8b919c"},
-		"indeterminate": {Type: "started", Color: "#d29922"},
-		"done":          {Type: "completed", Color: "#3fb950"},
+		"new":           {Type: Unstarted, Color: "#8b919c"},
+		"indeterminate": {Type: Started, Color: "#d29922"},
+		"done":          {Type: Completed, Color: "#3fb950"},
 	}
 	jiraSources = map[string]string{"assigned": "assignee", "created": "reporter", "subscribed": "watcher"}
 	jiraKey     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*-\d+$`)

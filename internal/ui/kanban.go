@@ -49,8 +49,8 @@ func (m model) ktaArgs(groupID string, tickets []string) []string {
 		work += " (group " + groupID + ")"
 	}
 	lines := []string{
-		"You're running inside kta, a terminal kanban of the user's " + tracker.Name() + " tickets where each ticket has its own Claude Code sessions. " + work + ".",
-		tracker.APIHint[tracker.Kind],
+		"You're running inside kta, a terminal kanban of the user's " + m.tracker.Name + " tickets where each ticket has its own Claude Code sessions. " + work + ".",
+		m.tracker.APIHint,
 	}
 	var prs []string
 	for _, t := range tickets {
@@ -59,7 +59,7 @@ func (m model) ktaArgs(groupID string, tickets []string) []string {
 		}
 	}
 	if len(prs) > 0 {
-		lines = append(lines, "Pull requests linked to them in "+tracker.Name()+": "+strings.Join(prs, "; ")+".")
+		lines = append(lines, "Pull requests linked to them in "+m.tracker.Name+": "+strings.Join(prs, "; ")+".")
 	}
 	lines = append(lines,
 		"Tickets can be grouped so one session works on several of them, and a ticket belongs to one group at most. When the user asks to add tickets to this work, bring them over from another group, take some out, or asks what is grouped, use these commands; the kanban changes right away:",
@@ -89,7 +89,7 @@ func (m model) sessionsOf(key string) []store.Session {
 func (m model) foldKey(key string) (model, tea.Cmd) {
 	var target *store.Group
 	if i := m.selectedIssue(); i != nil {
-		target = m.groupOf(i.Identifier)
+		target = m.groupOf(i.Key)
 	}
 	if key == "z" && target == nil {
 		return m, nil
@@ -119,23 +119,23 @@ func (m *model) collapse(items []tracker.Issue) []tracker.Issue {
 	var kept []tracker.Issue
 	hidden := map[string]bool{}
 	for _, i := range items {
-		if hidden[i.Identifier] {
+		if hidden[i.Key] {
 			continue
 		}
 		kept = append(kept, i)
-		g := m.groupOf(i.Identifier)
+		g := m.groupOf(i.Key)
 		if g == nil || !g.Collapsed {
 			continue
 		}
 		cg := cardGroup{Group: *g, issues: []tracker.Issue{i}}
 		for _, j := range items {
-			if j.Identifier != i.Identifier && !hidden[j.Identifier] && slices.Contains(g.Tickets, j.Identifier) {
-				hidden[j.Identifier] = true
+			if j.Key != i.Key && !hidden[j.Key] && slices.Contains(g.Tickets, j.Key) {
+				hidden[j.Key] = true
 				cg.issues = append(cg.issues, j)
 			}
 		}
 		if len(cg.issues) > 1 {
-			m.collapsed[i.Identifier] = cg
+			m.collapsed[i.Key] = cg
 		}
 	}
 	return kept
@@ -145,14 +145,14 @@ func (m model) clusterGroups(items []tracker.Issue) []tracker.Issue {
 	out := make([]tracker.Issue, 0, len(items))
 	placed := map[string]bool{}
 	for _, i := range items {
-		if placed[i.Identifier] {
+		if placed[i.Key] {
 			continue
 		}
-		out, placed[i.Identifier] = append(out, i), true
-		if g := m.groupOf(i.Identifier); g != nil {
+		out, placed[i.Key] = append(out, i), true
+		if g := m.groupOf(i.Key); g != nil {
 			for _, j := range items {
-				if !placed[j.Identifier] && slices.Contains(g.Tickets, j.Identifier) {
-					out, placed[j.Identifier] = append(out, j), true
+				if !placed[j.Key] && slices.Contains(g.Tickets, j.Key) {
+					out, placed[j.Key] = append(out, j), true
 				}
 			}
 		}
@@ -204,14 +204,14 @@ func (m model) openTicket(withNew bool) (model, tea.Cmd) {
 		return m, nil
 	}
 	var cmds []tea.Cmd
-	if m.ticket == nil || m.ticket.Identifier != i.Identifier {
+	if m.ticket == nil || m.ticket.Key != i.Key {
 		issue := *i
 		m.ticket, m.sel, m.mdRaw, m.mdWidth = &issue, 0, "", 0
 		m.vp.GotoTop()
-		cmds = append(cmds, loadDetailCmd(issue.Identifier))
+		cmds = append(cmds, m.loadDetailCmd(issue.Key))
 	}
 	var err error
-	if pane := m.bestPane(i.Identifier); pane != "" {
+	if pane := m.bestPane(i.Key); pane != "" {
 		err = tmux.ShowRight(pane)
 	} else {
 		err = tmux.HideRight()
@@ -240,11 +240,11 @@ func (m *model) startNew() tea.Cmd {
 
 func (m model) prsFor(key string) []string {
 	var fromTicket []string
-	if m.ticket != nil && m.ticket.Identifier == key {
+	if m.ticket != nil && m.ticket.Key == key {
 		fromTicket = issuePRs(*m.ticket)
 	}
 	var out []string
-	for _, u := range slices.Concat(fromTicket, m.linearPRs[key]) {
+	for _, u := range slices.Concat(fromTicket, m.ticketPRs[key]) {
 		if !slices.Contains(out, u) {
 			out = append(out, u)
 		}
@@ -253,10 +253,10 @@ func (m model) prsFor(key string) []string {
 }
 
 func (m model) cardKeys(i tracker.Issue) []string {
-	if cg := m.collapsed[i.Identifier]; len(cg.issues) > 1 {
+	if cg := m.collapsed[i.Key]; len(cg.issues) > 1 {
 		return cg.Tickets
 	}
-	return []string{i.Identifier}
+	return []string{i.Key}
 }
 
 func (m *model) openPRs(keys ...string) {
@@ -265,7 +265,7 @@ func (m *model) openPRs(keys ...string) {
 		prs = append(prs, m.prsFor(key)...)
 	}
 	if len(prs) == 0 {
-		m.err = fmt.Errorf("%s has no PRs in %s", strings.Join(keys, ", "), tracker.Name())
+		m.err = fmt.Errorf("%s has no PRs in %s", strings.Join(keys, ", "), m.tracker.Name)
 		return
 	}
 	for _, url := range prs {
@@ -303,13 +303,13 @@ func (m model) submit() (model, tea.Cmd) {
 		return m, func() tea.Msg {
 			issues := make([]tracker.Issue, len(keys))
 			for i, k := range keys {
-				issue, err := tracker.FetchIssue(k)
+				issue, err := m.tracker.Issue(k)
 				if err != nil {
 					return launchedMsg{err: err}
 				}
 				issues[i] = issue
 			}
-			pane, err := claude.Launch(rec.ID, title, append(append([]string{"--session-id", rec.ID, "-n", title}, extra...), "--", claude.BuildPrompt(issues, request, previous))...)
+			pane, err := claude.Launch(rec.ID, title, append(append([]string{"--session-id", rec.ID, "-n", title}, extra...), "--", claude.BuildPrompt(m.tracker.Kind, issues, request, previous))...)
 			return launchedMsg{keys: []string{target}, group: fresh, id: rec.ID, pane: pane, rec: &rec, err: err}
 		}
 	}
@@ -333,11 +333,11 @@ func (m model) submit() (model, tea.Cmd) {
 	}
 	extra := m.ktaArgs("", []string{key})
 	return m, func() tea.Msg {
-		issue, err := tracker.FetchIssue(key)
+		issue, err := m.tracker.Issue(key)
 		if err != nil {
 			return launchedMsg{err: err}
 		}
-		pane, err := claude.Launch(rec.ID, title, append(append([]string{"--session-id", rec.ID, "-n", title}, extra...), "--", claude.BuildPrompt([]tracker.Issue{issue}, request, previous))...)
+		pane, err := claude.Launch(rec.ID, title, append(append([]string{"--session-id", rec.ID, "-n", title}, extra...), "--", claude.BuildPrompt(m.tracker.Kind, []tracker.Issue{issue}, request, previous))...)
 		return launchedMsg{keys: []string{key}, id: rec.ID, pane: pane, rec: &rec, err: err}
 	}
 }
@@ -418,7 +418,7 @@ func (m model) listKey() string {
 		}
 		return ""
 	case m.ticket != nil:
-		return m.ticket.Identifier
+		return m.ticket.Key
 	}
 	return ""
 }
@@ -464,7 +464,7 @@ func (m model) sessionRank(key string) int {
 func (m *model) buildColumns() {
 	selected := ""
 	if i := m.selectedIssue(); i != nil {
-		selected = i.Identifier
+		selected = i.Key
 	}
 	q := strings.ToLower(m.search.Value())
 	index := map[string]int{}
@@ -478,7 +478,7 @@ func (m *model) buildColumns() {
 		}
 	}
 	for _, i := range m.issues {
-		if q != "" && !strings.Contains(strings.ToLower(i.Identifier+" "+i.Title), q) {
+		if q != "" && !strings.Contains(strings.ToLower(i.Key+" "+i.Title), q) {
 			continue
 		}
 		if slices.Contains(m.settings.HiddenColumns, i.State.Name) {
@@ -493,7 +493,7 @@ func (m *model) buildColumns() {
 		m.cols[k].items = append(m.cols[k].items, i)
 	}
 	slices.SortStableFunc(m.cols, func(a, b column) int { return stateCmp(a.state, b.state) })
-	weight := func(p float64) float64 {
+	weight := func(p int) int {
 		if p == 0 {
 			return 5
 		}
@@ -502,13 +502,13 @@ func (m *model) buildColumns() {
 	for _, c := range m.cols {
 		sort.SliceStable(c.items, func(a, b int) bool {
 			ia, ib := c.items[a], c.items[b]
-			if ra, rb := m.sessionRank(ia.Identifier), m.sessionRank(ib.Identifier); ra != rb {
+			if ra, rb := m.sessionRank(ia.Key), m.sessionRank(ib.Key); ra != rb {
 				return ra < rb
 			}
 			if weight(ia.Priority) != weight(ib.Priority) {
 				return weight(ia.Priority) < weight(ib.Priority)
 			}
-			return ia.UpdatedAt > ib.UpdatedAt
+			return ia.UpdatedAt.After(ib.UpdatedAt)
 		})
 	}
 	for c := range m.cols {
@@ -516,7 +516,7 @@ func (m *model) buildColumns() {
 	}
 	for c := range m.cols {
 		for r, i := range m.cols[c].items {
-			if i.Identifier == selected || slices.ContainsFunc(m.collapsed[i.Identifier].issues, func(x tracker.Issue) bool { return x.Identifier == selected }) {
+			if i.Key == selected || slices.ContainsFunc(m.collapsed[i.Key].issues, func(x tracker.Issue) bool { return x.Key == selected }) {
 				m.col, m.row = c, r
 			}
 		}
@@ -552,9 +552,9 @@ func (m model) selectedIssue() *tracker.Issue {
 
 func issuePRs(i tracker.Issue) []string {
 	var out []string
-	for _, a := range i.Attachments.Nodes {
-		if github.URLPattern.MatchString(a.URL) {
-			out = append(out, github.CanonicalPR(a.URL))
+	for _, u := range i.Links {
+		if github.URLPattern.MatchString(u) {
+			out = append(out, github.CanonicalPR(u))
 		}
 	}
 	return out

@@ -5,7 +5,6 @@ import (
 	"kta/internal/claude"
 	"kta/internal/config"
 	"kta/internal/tmux"
-	"kta/internal/tracker"
 	"kta/internal/ui"
 	"os"
 	"path/filepath"
@@ -30,9 +29,9 @@ func main() {
 		}
 		return
 	}
-	err := config.Load()
+	t, err := config.Load()
 	if arg == "setup" || (err != nil && arg == "check" && term.IsTerminal(int(os.Stdin.Fd()))) {
-		err = ui.RunWizard()
+		t, err = ui.RunWizard()
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -40,7 +39,7 @@ func main() {
 	}
 	switch arg {
 	case "group":
-		err = runGroup(os.Getenv("KTA_SESSION"), os.Args[2:], tracker.FetchIssue, os.Stdout)
+		err = runGroup(os.Getenv("KTA_SESSION"), os.Args[2:], t.Kind, t.Issue, os.Stdout)
 	case "groups":
 		err = runGroups(os.Stdout)
 	}
@@ -65,7 +64,7 @@ func main() {
 	for _, d := range []string{config.StatusDir, config.RunDir, config.ReviewsDir} {
 		os.MkdirAll(d, 0o700)
 	}
-	if err := ui.Run(); err != nil {
+	if err := ui.Run(t); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

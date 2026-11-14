@@ -34,7 +34,7 @@ func runGroups(w io.Writer) error {
 	return nil
 }
 
-func runGroup(session string, args []string, fetch func(string) (tracker.Issue, error), w io.Writer) error {
+func runGroup(session string, args []string, kind tracker.Kind, fetch func(string) (tracker.Issue, error), w io.Writer) error {
 	usage := errors.New("usage: kta group | kta group add KAN-123 … | kta group remove KAN-123 …  (add --group <id> to change another group)")
 	groupID, cmd := "", "list"
 	var targets []string
@@ -131,7 +131,7 @@ func runGroup(session string, args []string, fetch func(string) (tracker.Issue, 
 		}
 		added := make([]string, len(issues))
 		for i, issue := range issues {
-			added[i] = issue.Identifier
+			added[i] = issue.Key
 		}
 		var fresh *store.Group
 		if g == nil {
@@ -169,7 +169,7 @@ func runGroup(session string, args []string, fetch func(string) (tracker.Issue, 
 		}
 		fmt.Fprintln(w, "\nThe new tickets:")
 		for _, i := range issues {
-			fmt.Fprintf(w, "\n%s\n", strings.Join(claude.TicketSection(i), "\n"))
+			fmt.Fprintf(w, "\n%s\n", strings.Join(claude.TicketSection(kind, i), "\n"))
 		}
 		return nil
 	}

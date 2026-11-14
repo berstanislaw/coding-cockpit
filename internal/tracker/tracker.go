@@ -1,78 +1,103 @@
 package tracker
 
 import (
-	"errors"
 	"fmt"
-	"os"
+	"slices"
+	"strings"
 )
 
-func Configure(kind string, jira bool) error {
-	if Kind = kind; Kind == "" {
-		Kind = "linear"
-		if jira {
-			Kind = "jira"
+type Kind struct {
+	Key, Name, About, Team, APIHint string
+	Fields                          []Field
+	Sources                         []string
+	open                            func(env map[string]string) backend
+}
+
+type Field struct {
+	Env, Label, Hint, Placeholder string
+	Secret                        bool
+	clean                         func(string) string
+}
+
+type Client struct {
+	Kind
+	backend
+}
+
+type backend interface {
+	Me() (string, error)
+	Board(sources []string) ([]Issue, error)
+	Issue(key string) (Issue, error)
+	Done(keys []string) ([]string, error)
+	States(teams []string) ([]State, error)
+}
+
+func (f Field) Clean(v string) string {
+	if v = strings.TrimSpace(v); f.clean != nil {
+		v = f.clean(v)
+	}
+	return v
+}
+
+func (k Kind) Supports(source string) bool {
+	return k.Sources == nil || slices.Contains(k.Sources, source)
+}
+
+func Connect(k Kind, env func(string) string) (Client, error) {
+	values := map[string]string{}
+	for _, f := range k.Fields {
+		if values[f.Env] = f.Clean(env(f.Env)); values[f.Env] == "" {
+			return Client{}, fmt.Errorf("%s: %s is missing", k.Name, f.Label)
 		}
 	}
-	switch Kind {
-	case "linear":
-		if LinearKey = os.Getenv("LINEAR_API_KEY"); LinearKey == "" {
-			return errors.New("Linear key missing")
+	return Client{k, k.open(values)}, nil
+}
+
+func Open(env func(string) string) (Client, error) {
+	key := KeyOf(env)
+	i := slices.IndexFunc(All, func(k Kind) bool { return k.Key == key })
+	if i < 0 {
+		var keys []string
+		for _, k := range All {
+			keys = append(keys, k.Key)
 		}
-	case "jira":
-		JiraURL, JiraEmail, JiraToken = JiraSite(os.Getenv("JIRA_URL")), os.Getenv("JIRA_EMAIL"), os.Getenv("JIRA_API_TOKEN")
-		if JiraURL == "" || JiraEmail == "" || JiraToken == "" {
-			return errors.New("Jira account missing")
+		return Client{}, fmt.Errorf("TRACKER=%s isn't one of %s", key, strings.Join(keys, ", "))
+	}
+	return Connect(All[i], env)
+}
+
+func KeyOf(env func(string) string) string {
+	if key := env("TRACKER"); key != "" {
+		return key
+	}
+	if env("JIRA_URL") != "" {
+		return "jira"
+	}
+	return "linear"
+}
+
+func Names() []string {
+	out := make([]string, len(All))
+	for i, k := range All {
+		out[i] = k.Name
+	}
+	return out
+}
+
+func EnvNames() []string {
+	var out []string
+	for _, k := range All {
+		for _, f := range k.Fields {
+			out = append(out, f.Env)
 		}
-	default:
-		return fmt.Errorf("TRACKER=%s isn't linear or jira", Kind)
 	}
-	return nil
+	return out
 }
 
-func Name() string {
-	if Kind == "jira" {
-		return "Jira"
-	}
-	return "Linear"
-}
+var All = []Kind{linearKind, jiraKind, trelloKind}
 
-func FetchBoard(sources []string) ([]Issue, error) {
-	if Kind == "jira" {
-		return jiraBoard(sources)
-	}
-	return linearBoard(sources)
-}
-
-func FetchIssue(key string) (Issue, error) {
-	if Kind == "jira" {
-		return jiraIssueDetail(key)
-	}
-	return linearIssue(key)
-}
-
-func FetchDone(keys []string) ([]string, error) {
-	if Kind == "jira" {
-		return jiraDone(keys)
-	}
-	return linearDone(keys)
-}
-
-func FetchStates(teams []string) ([]State, error) {
-	if Kind == "jira" {
-		return jiraStates(teams)
-	}
-	return linearStates(teams)
-}
-
-var Sources = []struct{ Key, Label, field string }{
-	{"assigned", "assigned to me", "assignee"},
-	{"created", "created by me", "creator"},
-	{"subscribed", "subscribed to", "subscribers"},
-}
-
-var Kind = "linear"
-
-var APIHint = map[string]string{
-	"linear": "To read or change tickets, call https://api.linear.app/graphql with $LINEAR_API_KEY as the Authorization header (no Bearer).",
-	"jira":   "To read or change tickets, use the Jira Cloud REST API v3 at $JIRA_URL/rest/api/3 with basic auth $JIRA_EMAIL:$JIRA_API_TOKEN; moving a ticket to another status goes through GET and POST /rest/api/3/issue/<key>/transitions.",
+var Sources = []struct{ Key, Label string }{
+	{"assigned", "assigned to me"},
+	{"created", "created by me"},
+	{"subscribed", "subscribed to"},
 }

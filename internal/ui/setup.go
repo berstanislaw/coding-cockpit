@@ -16,8 +16,11 @@ import (
 
 func newWizard(old map[string]string) wizard {
 	w := wizard{old: old}
-	if old["TRACKER"] == "jira" || (old["TRACKER"] == "" && old["JIRA_URL"] != "") {
-		w.choice = 1
+	kind := tracker.KeyOf(func(name string) string { return old[name] })
+	for i, t := range tracker.All {
+		if t.Key == kind {
+			w.choice = i
+		}
 	}
 	w.folder = textinput.New()
 	w.folder.Prompt = ""
@@ -32,32 +35,29 @@ func newWizard(old map[string]string) wizard {
 	return w
 }
 
-func (w wizard) tracker() string { return trackers[w.choice].key }
+func (w wizard) kind() tracker.Kind { return tracker.All[w.choice] }
 
 func (w *wizard) buildInputs() {
-	fields := accountFields[w.tracker()]
+	fields := w.kind().Fields
 	w.inputs = make([]textinput.Model, len(fields))
 	for i, f := range fields {
 		in := textinput.New()
-		in.Prompt = fmt.Sprintf("%-10s", f.label)
+		in.Prompt = fmt.Sprintf("%-10s", f.Label)
 		in.Width = 40
-		value := w.old[f.env]
-		switch {
-		case secretEnv[f.env]:
+		value := w.old[f.Env]
+		if f.Secret {
 			in.EchoMode, in.EchoCharacter = textinput.EchoPassword, '•'
 			in.Placeholder = "paste it here, it won't show"
 			if value != "" {
 				in.Placeholder = "enter keeps the current one"
 			}
-		case f.env == "JIRA_URL":
+		} else {
 			in.SetValue(strings.TrimPrefix(value, "https://"))
-			in.Placeholder = "acme.atlassian.net"
-		default:
-			in.SetValue(value)
+			in.Placeholder = f.Placeholder
 		}
 		w.inputs[i] = in
 	}
-	w.field, w.built = 0, w.tracker()
+	w.field, w.built = 0, w.kind().Key
 }
 
 func (w *wizard) focus() tea.Cmd {
@@ -76,15 +76,12 @@ func (w *wizard) focus() tea.Cmd {
 
 func (w wizard) values() map[string]string {
 	v := map[string]string{}
-	for i, f := range accountFields[w.tracker()] {
-		value := strings.TrimSpace(w.inputs[i].Value())
-		if value == "" && secretEnv[f.env] {
-			value = w.old[f.env]
+	for i, f := range w.kind().Fields {
+		value := f.Clean(w.inputs[i].Value())
+		if value == "" && f.Secret {
+			value = w.old[f.Env]
 		}
-		if f.env == "JIRA_URL" {
-			value = tracker.JiraSite(value)
-		}
-		v[f.env] = value
+		v[f.Env] = value
 	}
 	return v
 }
@@ -94,26 +91,22 @@ func (w wizard) env() map[string]string {
 	if env == nil {
 		env = map[string]string{}
 	}
-	for _, fields := range accountFields {
-		for _, f := range fields {
-			delete(env, f.env)
-		}
+	for _, name := range tracker.EnvNames() {
+		delete(env, name)
 	}
 	maps.Copy(env, w.values())
-	env["TRACKER"] = w.tracker()
+	env["TRACKER"] = w.kind().Key
 	env["WORKSPACE_DIR"] = strings.TrimSpace(w.folder.Value())
 	return env
 }
 
-func checkAccount(t string, v map[string]string) tea.Cmd {
+func checkAccount(kind tracker.Kind, v map[string]string) tea.Cmd {
 	return func() tea.Msg {
-		if t == "jira" {
-			tracker.JiraURL, tracker.JiraEmail, tracker.JiraToken = v["JIRA_URL"], v["JIRA_EMAIL"], v["JIRA_API_TOKEN"]
-			name, err := tracker.JiraMyself()
-			return accountMsg{name, err}
+		t, err := tracker.Connect(kind, func(name string) string { return v[name] })
+		if err != nil {
+			return accountMsg{err: err}
 		}
-		tracker.LinearKey = v["LINEAR_API_KEY"]
-		name, err := tracker.LinearViewer()
+		name, err := t.Me()
 		return accountMsg{name, err}
 	}
 }
@@ -160,9 +153,9 @@ func (w wizard) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "up", "k", "shift+tab":
 			w.choice = max(0, w.choice-1)
 		case "down", "j", "tab":
-			w.choice = min(len(trackers)-1, w.choice+1)
+			w.choice = min(len(tracker.All)-1, w.choice+1)
 		case "enter":
-			if w.built != w.tracker() {
+			if w.built != w.kind().Key {
 				w.buildInputs()
 				w.account = ""
 			}
@@ -180,14 +173,14 @@ func (w wizard) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return w, w.focus()
 		case "enter":
 			v := w.values()
-			for i, f := range accountFields[w.tracker()] {
-				if v[f.env] == "" {
-					w.field, w.err = i, f.label+" is missing"
+			for i, f := range w.kind().Fields {
+				if v[f.Env] == "" {
+					w.field, w.err = i, f.Label+" is missing"
 					return w, w.focus()
 				}
 			}
 			w.checking, w.err, w.account = true, "", ""
-			return w, checkAccount(w.tracker(), v)
+			return w, checkAccount(w.kind(), v)
 		}
 		var cmd tea.Cmd
 		w.inputs[w.field], cmd = w.inputs[w.field].Update(k)
@@ -244,20 +237,20 @@ func (w wizard) View() string {
 	switch w.step {
 	case stepTracker:
 		lines = append(lines, "Where do your tickets live?", "")
-		for i, t := range trackers {
+		for i, t := range tracker.All {
 			if i == w.choice {
-				lines = append(lines, accentStyle.Render(fmt.Sprintf("▸ %-8s", t.name))+dim.Render(t.about))
+				lines = append(lines, accentStyle.Render(fmt.Sprintf("▸ %-8s", t.Name))+dim.Render(t.About))
 			} else {
-				lines = append(lines, fmt.Sprintf("  %-8s", t.name)+dim.Render(t.about))
+				lines = append(lines, fmt.Sprintf("  %-8s", t.Name)+dim.Render(t.About))
 			}
 		}
 		keys = "↑↓ choose · enter next · esc cancel"
 	case stepAccount:
-		lines = append(lines, "Connect your "+trackers[w.choice].name+" account", "")
+		lines = append(lines, "Connect your "+w.kind().Name+" account", "")
 		for _, in := range w.inputs {
 			lines = append(lines, in.View())
 		}
-		lines = append(lines, "", dim.Render(accountFields[w.tracker()][w.field].hint))
+		lines = append(lines, "", dim.Render(w.kind().Fields[w.field].Hint))
 		switch {
 		case w.checking:
 			lines = append(lines, "", stateStyle["waiting"].Render("checking…"))
@@ -270,19 +263,19 @@ func (w wizard) View() string {
 		keys = "enter next · esc back"
 	case stepSave:
 		v := w.values()
-		where := trackers[w.choice].name
-		if w.tracker() == "jira" {
-			where += "  " + dim.Render(strings.TrimPrefix(v["JIRA_URL"], "https://"))
-		}
-		folder := w.folder.Value()
 		saved := config.EnvFile
 		if rest, ok := strings.CutPrefix(saved, config.Home+"/"); ok {
 			saved = "~/" + rest
 		}
+		lines = append(lines, dim.Render("Tracker   ")+w.kind().Name)
+		for _, f := range w.kind().Fields {
+			if !f.Secret {
+				lines = append(lines, dim.Render(fmt.Sprintf("%-10s", f.Label))+strings.TrimPrefix(v[f.Env], "https://"))
+			}
+		}
 		lines = append(lines,
-			dim.Render("Tracker   ")+where,
 			dim.Render("Account   ")+w.account,
-			dim.Render("Folder    ")+folder,
+			dim.Render("Folder    ")+w.folder.Value(),
 			"",
 			dim.Render("Saved to "+saved+", readable only by you."),
 			dim.Render("Claude sessions on this board get them as environment variables."))
@@ -296,13 +289,13 @@ func (w wizard) View() string {
 	return lipgloss.Place(w.w, w.h, lipgloss.Center, lipgloss.Center, box)
 }
 
-func RunWizard() error {
+func RunWizard() (tracker.Client, error) {
 	final, err := tea.NewProgram(newWizard(config.ReadEnv(config.EnvFile)), tea.WithAltScreen()).Run()
 	if err != nil {
-		return err
+		return tracker.Client{}, err
 	}
 	if w, ok := final.(wizard); !ok || !w.saved {
-		return errors.New("setup cancelled")
+		return tracker.Client{}, errors.New("setup cancelled")
 	}
 	return config.Load()
 }
@@ -315,26 +308,8 @@ const (
 )
 
 var (
-	trackers = []struct{ key, name, about string }{
-		{"linear", "Linear", "linear.app, with a personal API key"},
-		{"jira", "Jira", "Jira Cloud, with your email and an API token"},
-	}
 	stepNames = []string{"tracker", "account", "folder", "save"}
-	secretEnv = map[string]bool{"LINEAR_API_KEY": true, "JIRA_API_TOKEN": true}
 )
-
-type accountField struct {
-	env, label, hint string
-}
-
-var accountFields = map[string][]accountField{
-	"linear": {{"LINEAR_API_KEY", "API key", "Linear → Settings → Account → Security & access → Personal API keys"}},
-	"jira": {
-		{"JIRA_URL", "Site", "the address of your Jira, like acme.atlassian.net (acme works too)"},
-		{"JIRA_EMAIL", "Email", "the email you sign in to Atlassian with"},
-		{"JIRA_API_TOKEN", "API token", "id.atlassian.com → Security → Create and manage API tokens"},
-	},
-}
 
 type accountMsg struct {
 	name string

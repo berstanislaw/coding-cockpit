@@ -53,7 +53,7 @@ func PreviousSessions(list []store.Session, live map[string]string) []string {
 	}, append(lines, "")...)
 }
 
-func BuildPrompt(issues []tracker.Issue, request string, previous []string) string {
+func BuildPrompt(kind tracker.Kind, issues []tracker.Issue, request string, previous []string) string {
 	request = strings.TrimSpace(request)
 	switch {
 	case request != "":
@@ -70,7 +70,7 @@ func BuildPrompt(issues []tracker.Issue, request string, previous []string) stri
 		if k > 0 {
 			parts = append(parts, "")
 		}
-		parts = append(parts, TicketSection(i)...)
+		parts = append(parts, TicketSection(kind, i)...)
 	}
 	return clipPrompt(strings.Join(parts, "\n"))
 }
@@ -82,32 +82,20 @@ func clipPrompt(text string) string {
 	return text
 }
 
-func TicketSection(i tracker.Issue) []string {
-	labels := make([]string, len(i.Labels.Nodes))
-	for k, l := range i.Labels.Nodes {
-		labels[k] = l.Name
-	}
-	team := "Team"
-	if tracker.Kind == "jira" {
-		team = "Project"
-	}
-	status := fmt.Sprintf("Status: %s · %s: %s", i.State.Name, team, i.Team.Key)
-	if len(labels) > 0 {
-		status += " · Labels: " + strings.Join(labels, ", ")
+func TicketSection(kind tracker.Kind, i tracker.Issue) []string {
+	status := fmt.Sprintf("Status: %s · %s: %s", i.State.Name, kind.Team, i.Team)
+	if len(i.Labels) > 0 {
+		status += " · Labels: " + strings.Join(i.Labels, ", ")
 	}
 	description := i.Description
 	if description == "" {
 		description = "(no description)"
 	}
-	parts := []string{fmt.Sprintf("# %s ticket %s: %s", tracker.Name(), i.Identifier, i.Title), i.URL, status, "", "## Description", description}
-	if len(i.Comments.Nodes) > 0 {
+	parts := []string{fmt.Sprintf("# %s ticket %s: %s", kind.Name, i.Key, i.Title), i.URL, status, "", "## Description", description}
+	if len(i.Comments) > 0 {
 		parts = append(parts, "", "## Comments")
-		for _, c := range i.Comments.Nodes {
-			name := "integration"
-			if c.User != nil {
-				name = c.User.Name
-			}
-			parts = append(parts, fmt.Sprintf("- %s (%.10s): %s", name, c.CreatedAt, c.Body))
+		for _, c := range i.Comments {
+			parts = append(parts, fmt.Sprintf("- %s (%s): %s", c.Author, c.CreatedAt.Format(time.DateOnly), c.Body))
 		}
 	}
 	return parts

@@ -4,13 +4,13 @@
 
 **Your tickets in a terminal kanban, with Claude Code sessions right next to them.**
 
-Pick a card, tell Claude what to do, and follow every session from one screen. A dot on each card shows which ones are working, waiting for you or stopped. Works with Linear and Jira.
+Pick a card, tell Claude what to do, and follow every session from one screen. A dot on each card shows which ones are working, waiting for you or stopped. Works with Linear, Jira and Trello.
 
 ## What you need
 
 - [tmux](https://github.com/tmux/tmux/wiki/Installing) and [Go](https://go.dev/dl/)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code), logged in
-- An API key from your kanban (Linear or Jira)
+- An API key from your kanban: Linear, Jira or Trello ([how to get one](docs/how-to/api-keys.md))
 
 On macOS that's `brew install tmux go`. On Linux, install tmux from your package manager and Go from [go.dev/dl](https://go.dev/dl/).
 
@@ -74,6 +74,7 @@ Mark cards with `g` and press `n`: one session works on all of them, and the car
 | `z` / `Z` | fold or unfold a group / every group |
 | `p` / `o` | open the PRs / the ticket in the browser |
 | `/` | search |
+| `r` | reload the board, or try again when the tracker didn't respond |
 | `tab` / `esc` | go to the ticket panel / back |
 | `x x` / `d d` | stop / remove a session |
 | `alt+1` … `alt+5` | switch tabs, also from inside Claude |
@@ -117,11 +118,19 @@ For the curious, or when something looks off.
   WORKSPACE_DIR='~/projects/my-repo'
   ```
 
-  Linear keys come from Settings → Account → Security & access → Personal API keys. Jira tokens come from id.atlassian.com → Security → Create and manage API tokens.
+  ```sh
+  TRACKER='trello'
+  TRELLO_API_KEY='…'
+  TRELLO_TOKEN='…'
+  WORKSPACE_DIR='~/projects/my-repo'
+  ```
+
+  How to get each key is in [docs/how-to/api-keys.md](docs/how-to/api-keys.md).
 - **Workspaces.** The default one lives in `~/.config/kta/`, the others in `~/.config/kta/workspaces/<name>/`, each with its own key, folder, sessions, groups and settings. `./kta <name>` opens one from the terminal, and `./kta default` goes back.
 - **What Claude gets.** Every session started by the board starts in `WORKSPACE_DIR`, with the workspace's credentials as environment variables and a note on how to use your tracker's API. "Move this ticket to In Review" works with no extra setup. It's also told where the transcripts of the ticket's older sessions are, so it can catch up.
 - **Statuses.** They come from Claude Code hooks, passed with `--settings` when a session starts. The hooks call `kta hook`, which writes the status and sends the desktop notification (on Linux that needs `notify-send`).
 - **Board.** You see every ticket assigned to you, in every status. Settings can add the ones you created or follow, and hide columns. It refreshes every 30 seconds. When a ticket is finished or canceled, the board forgets its stopped sessions.
+- **Trello.** A ticket is a card you're a member of, its key is the card's short link (the `aBcD1234` in `trello.com/c/aBcD1234`) and its status is its list. A card counts as finished when it's archived or sits in a list called something like Done.
 - **Groups.** A group has an id, lives in `groups.json` and keeps its tickets until they're all finished. Sessions manage it with these commands, which kta tells them about:
 
   | command | does |
@@ -133,14 +142,14 @@ For the curious, or when something looks off.
 - **PRs on cards.** On Linear, they come from its GitHub integration and show up tagged by repo, like `A#1782`.
 - **Reviews.** On a team PR, `r` asks Claude for a review in the background (`claude -p` with read-only tools). Go through the threads with `←` / `→`. `a` discusses one, `c` rewrites its comment, `x x` drops it, and `s s` sends them all to GitHub as a draft review only you can see.
 - **Daily.** It reads your Claude sessions since the last working day and asks Claude Haiku for one bullet per subject, in the language picked in settings.
-- **Code.** `cmd/kta` is the entry point. `internal/` has one package per concern: `config`, `tracker` (Linear and Jira), `store` (sessions, groups, settings), `tmux`, `claude` (launching sessions, hooks, prompts), `github`, `review`, `daily` and `ui` (the board).
+- **Code.** `cmd/kta` is the entry point. `internal/` has one package per concern: `config`, `tracker` (one file per tracker: Linear, Jira and Trello), `store` (sessions, groups, settings), `tmux`, `claude` (launching sessions, hooks, prompts), `github`, `review`, `daily` and `ui` (the board).
 - **Tests.** Run `go test ./...`. They never touch your real config. To build by hand, use `go build -o bin/kta ./cmd/kta`.
 
 ## TODO
 
-- PRs on Jira cards (Jira only exposes them through an undocumented API)
+- PRs on Jira and Trello cards (Jira only exposes them through an undocumented API)
 - Jira Server / Data Center
-- More trackers, like GitHub Projects. A tracker is one file in `internal/tracker`, next to `linear.go` and `jira.go`.
+- More trackers, like GitHub Projects. A tracker is one file in `internal/tracker`: a `Kind` (name, setup fields, API hint) and a client with the five methods of `backend` in `tracker.go`, plus one line in `All`. Look at `trello.go` for a small one.
 
 ## Troubleshooting
 

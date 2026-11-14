@@ -5,15 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"slices"
-	"sort"
 	"strings"
+	"time"
 )
 
-func linear(query string, vars map[string]any, out any) error {
-	if LinearKey == "" {
+func (l linear) do(query string, vars map[string]any, out any) error {
+	if l.key == "" {
 		return errors.New("LINEAR_API_KEY is missing")
 	}
 	body, err := json.Marshal(map[string]any{"query": query, "variables": vars})
@@ -25,14 +24,10 @@ func linear(query string, vars map[string]any, out any) error {
 		return err
 	}
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("authorization", LinearKey)
-	res, err := httpClient.Do(req)
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return fmt.Errorf("Linear didn't respond in %s · press r to retry", httpClient.Timeout)
-	}
+	req.Header.Set("authorization", l.key)
+	res, err := send("Linear", req)
 	if err != nil {
-		return fmt.Errorf("can't reach Linear (%v) · press r to retry", errors.Unwrap(err))
+		return err
 	}
 	defer res.Body.Close()
 	var r struct {
@@ -52,12 +47,12 @@ func linear(query string, vars map[string]any, out any) error {
 	return json.Unmarshal(r.Data, out)
 }
 
-func linearBoard(sources []string) ([]Issue, error) {
+func (l linear) Board(sources []string) ([]Issue, error) {
 	me := map[string]any{"isMe": map[string]any{"eq": true}}
 	var who []map[string]any
 	for _, src := range Sources {
 		if slices.Contains(sources, src.Key) {
-			who = append(who, map[string]any{src.field: me})
+			who = append(who, map[string]any{linearSources[src.Key]: me})
 		}
 	}
 	filter := map[string]any{"or": who}
@@ -70,14 +65,16 @@ func linearBoard(sources []string) ([]Issue, error) {
 					HasNextPage bool
 					EndCursor   string
 				}
-				Nodes []Issue
+				Nodes []linearIssue
 			}
 		}
-		if err := linear(boardQuery, map[string]any{"after": after, "filter": filter}, &d); err != nil {
+		if err := l.do(boardQuery, map[string]any{"after": after, "filter": filter}, &d); err != nil {
 			return nil, err
 		}
 		page := d.Issues
-		issues = append(issues, page.Nodes...)
+		for _, n := range page.Nodes {
+			issues = append(issues, n.issue())
+		}
 		if !page.PageInfo.HasNextPage {
 			return issues, nil
 		}
@@ -85,11 +82,11 @@ func linearBoard(sources []string) ([]Issue, error) {
 	}
 }
 
-func linearDone(keys []string) ([]string, error) {
+func (l linear) Done(keys []string) ([]string, error) {
 	var d struct {
 		Issues struct{ Nodes []struct{ Identifier string } }
 	}
-	if err := linear(doneQuery, map[string]any{"ids": keys}, &d); err != nil {
+	if err := l.do(doneQuery, map[string]any{"ids": keys}, &d); err != nil {
 		return nil, err
 	}
 	out := make([]string, len(d.Issues.Nodes))
@@ -99,37 +96,55 @@ func linearDone(keys []string) ([]string, error) {
 	return out, nil
 }
 
-func LinearViewer() (string, error) {
+func (l linear) Me() (string, error) {
 	var d struct{ Viewer struct{ Name string } }
-	err := linear(`{ viewer { name } }`, nil, &d)
+	err := l.do(`{ viewer { name } }`, nil, &d)
 	return d.Viewer.Name, err
 }
 
-func linearStates(teams []string) ([]State, error) {
+func (l linear) States(teams []string) ([]State, error) {
 	var d struct {
 		Teams struct {
-			Nodes []struct{ States struct{ Nodes []State } }
+			Nodes []struct{ States struct{ Nodes []linearState } }
 		}
 	}
-	if err := linear(statesQuery, map[string]any{"keys": teams}, &d); err != nil {
+	if err := l.do(statesQuery, map[string]any{"keys": teams}, &d); err != nil {
 		return nil, err
 	}
 	var out []State
 	for _, t := range d.Teams.Nodes {
-		out = append(out, t.States.Nodes...)
+		for _, st := range t.States.Nodes {
+			out = append(out, State(st))
+		}
 	}
 	return out, nil
 }
 
-func linearIssue(key string) (Issue, error) {
-	var d struct{ Issue Issue }
-	if err := linear(issueQuery, map[string]any{"id": key}, &d); err != nil {
+func (l linear) Issue(key string) (Issue, error) {
+	var d struct{ Issue linearIssue }
+	if err := l.do(issueQuery, map[string]any{"id": key}, &d); err != nil {
 		return Issue{}, err
 	}
-	sort.SliceStable(d.Issue.Comments.Nodes, func(a, b int) bool {
-		return d.Issue.Comments.Nodes[a].CreatedAt < d.Issue.Comments.Nodes[b].CreatedAt
-	})
-	return d.Issue, nil
+	return d.Issue.issue(), nil
+}
+
+func (n linearIssue) issue() Issue {
+	i := Issue{Key: n.Identifier, Title: n.Title, URL: n.URL, Description: n.Description, UpdatedAt: n.UpdatedAt, Priority: int(n.Priority), State: State(n.State), Team: n.Team.Key}
+	for _, l := range n.Labels.Nodes {
+		i.Labels = append(i.Labels, l.Name)
+	}
+	for _, c := range n.Comments.Nodes {
+		author := "integration"
+		if c.User != nil {
+			author = c.User.Name
+		}
+		i.Comments = append(i.Comments, Comment{Author: author, Body: c.Body, CreatedAt: c.CreatedAt})
+	}
+	for _, a := range n.Attachments.Nodes {
+		i.Links = append(i.Links, a.URL)
+	}
+	slices.SortStableFunc(i.Comments, func(a, b Comment) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	return i
 }
 
 const boardQuery = `query($after: String, $filter: IssueFilter) {
@@ -139,7 +154,7 @@ const boardQuery = `query($after: String, $filter: IssueFilter) {
       identifier title url priority updatedAt
       state { name type position color }
       team { key }
-      labels(first: 10) { nodes { name color } }
+      labels(first: 10) { nodes { name } }
       attachments { nodes { url } }
     }
   }
@@ -151,10 +166,10 @@ const statesQuery = `query($keys: [String!]) {
 
 const issueQuery = `query($id: String!) {
   issue(id: $id) {
-    identifier title url priority description
+    identifier title url priority description updatedAt
     state { name type position color }
     team { key }
-    labels(first: 10) { nodes { name color } }
+    labels(first: 10) { nodes { name } }
     attachments { nodes { url } }
     comments(first: 100) { nodes { body createdAt user { name } } }
   }
@@ -166,4 +181,39 @@ const doneQuery = `query($ids: [ID!]) {
   }
 }`
 
-var LinearKey string
+var linearKind = Kind{
+	Key:     "linear",
+	Name:    "Linear",
+	About:   "linear.app, with a personal API key",
+	Team:    "Team",
+	APIHint: "To read or change tickets, call https://api.linear.app/graphql with $LINEAR_API_KEY as the Authorization header (no Bearer).",
+	Fields:  []Field{{Env: "LINEAR_API_KEY", Label: "API key", Hint: "Linear → Settings → Account → Security & access → Personal API keys", Secret: true}},
+	open:    func(env map[string]string) backend { return linear{env["LINEAR_API_KEY"]} },
+}
+
+var linearSources = map[string]string{"assigned": "assignee", "created": "creator", "subscribed": "subscribers"}
+
+type linear struct{ key string }
+
+type linearState struct {
+	Name, Type string
+	Position   float64
+	Color      string
+}
+
+type linearIssue struct {
+	Identifier, Title, URL, Description string
+	UpdatedAt                           time.Time
+	Priority                            float64
+	State                               linearState
+	Team                                struct{ Key string }
+	Labels                              struct{ Nodes []struct{ Name string } }
+	Comments                            struct {
+		Nodes []struct {
+			Body      string
+			CreatedAt time.Time
+			User      *struct{ Name string }
+		}
+	}
+	Attachments struct{ Nodes []struct{ URL string } }
+}

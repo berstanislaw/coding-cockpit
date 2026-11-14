@@ -14,12 +14,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func loadBoardCmd(sources []string) tea.Cmd {
-	return func() tea.Msg { issues, err := tracker.FetchBoard(sources); return boardMsg{issues, err} }
+func (m model) loadBoardCmd(sources []string) tea.Cmd {
+	t := m.tracker
+	return func() tea.Msg { issues, err := t.Board(sources); return boardMsg{issues, err} }
 }
 
-func loadDetailCmd(key string) tea.Cmd {
-	return func() tea.Msg { issue, err := tracker.FetchIssue(key); return detailMsg{issue, err} }
+func (m model) loadDetailCmd(key string) tea.Cmd {
+	t := m.tracker
+	return func() tea.Msg { issue, err := t.Issue(key); return detailMsg{issue, err} }
 }
 
 func refreshStateCmd() tea.Cmd {
@@ -34,9 +36,10 @@ func refreshStateCmd() tea.Cmd {
 	}
 }
 
-func doneCmd(keys []string) tea.Cmd {
+func (m model) doneCmd(keys []string) tea.Cmd {
+	t := m.tracker
 	return func() tea.Msg {
-		done, err := tracker.FetchDone(keys)
+		done, err := t.Done(keys)
 		if err != nil || len(done) == 0 {
 			return nil
 		}
@@ -60,7 +63,7 @@ func resumeCmd(id, title string, extra []string) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadBoardCmd(m.settings.Sources()), refreshStateCmd(), tick(), boardTick())
+	return tea.Batch(m.loadBoardCmd(m.settings.Sources()), refreshStateCmd(), tick(), boardTick())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -73,7 +76,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.BlurMsg:
 		m.paneFocused = false
 	case boardTickMsg:
-		cmds := []tea.Cmd{loadBoardCmd(m.settings.Sources()), boardTick()}
+		cmds := []tea.Cmd{m.loadBoardCmd(m.settings.Sources()), boardTick()}
 		if m.tab == tabReviews && time.Since(m.prsAt) > 5*time.Minute {
 			cmds = append(cmds, github.PRsCmd(m.settings.ReviewLabels))
 		}
@@ -82,21 +85,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading, m.err = false, msg.err
 		if msg.err == nil {
 			m.issues = msg.issues
-			m.linearPRs = map[string][]string{}
+			m.ticketPRs = map[string][]string{}
 			for _, i := range msg.issues {
 				if prs := issuePRs(i); len(prs) > 0 {
-					m.linearPRs[i.Identifier] = prs
+					m.ticketPRs[i.Key] = prs
 				}
 			}
 			m.buildColumns()
 			for _, i := range msg.issues {
-				if m.ticket != nil && i.Identifier == m.ticket.Identifier {
+				if m.ticket != nil && i.Key == m.ticket.Key {
 					m.ticket.State, m.ticket.Title, m.ticket.Priority = i.State, i.Title, i.Priority
 				}
 			}
 			var gone []string
 			onBoard := func(key string) bool {
-				return slices.ContainsFunc(msg.issues, func(i tracker.Issue) bool { return i.Identifier == key })
+				return slices.ContainsFunc(msg.issues, func(i tracker.Issue) bool { return i.Key == key })
 			}
 			for key := range m.sessions {
 				if store.IsTicketKey(key) && !onBoard(key) {
@@ -112,12 +115,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var cmds []tea.Cmd
 			if len(gone) > 0 {
-				cmds = append(cmds, doneCmd(gone))
+				cmds = append(cmds, m.doneCmd(gone))
 			}
 			var finished []string
 			for _, i := range msg.issues {
-				if t := i.State.Type; (t == "completed" || t == "canceled") && m.leftovers(i.Identifier) {
-					finished = append(finished, i.Identifier)
+				if t := i.State.Type; (t == tracker.Completed || t == tracker.Canceled) && m.leftovers(i.Key) {
+					finished = append(finished, i.Key)
 				}
 			}
 			if len(finished) > 0 {
@@ -125,7 +128,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if teams := teamKeys(msg.issues); !slices.Equal(teams, m.stateTeams) {
 				m.stateTeams = teams
-				cmds = append(cmds, statesCmd(msg.issues))
+				cmds = append(cmds, m.statesCmd(msg.issues))
 			}
 			cmd = tea.Batch(cmds...)
 		}
@@ -142,7 +145,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.err = nil
-		if m.ticket != nil && m.ticket.Identifier == msg.issue.Identifier {
+		if m.ticket != nil && m.ticket.Key == msg.issue.Key {
 			m.ticket = &msg.issue
 			m.mdRaw, m.mdWidth = issueMarkdown(msg.issue), 0
 		}

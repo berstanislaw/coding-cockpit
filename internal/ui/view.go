@@ -77,12 +77,8 @@ func issueMarkdown(i tracker.Issue) string {
 		b.WriteString("_no description_")
 	}
 	b.WriteString(i.Description)
-	for _, c := range i.Comments.Nodes {
-		name := "integration"
-		if c.User != nil {
-			name = c.User.Name
-		}
-		fmt.Fprintf(&b, "\n\n---\n\n**%s** · %.10s\n\n%s", name, c.CreatedAt, c.Body)
+	for _, c := range i.Comments {
+		fmt.Fprintf(&b, "\n\n---\n\n**%s** · %s\n\n%s", c.Author, c.CreatedAt.Format(time.DateOnly), c.Body)
 	}
 	return b.String()
 }
@@ -247,7 +243,11 @@ func (m model) header() string {
 		header += dim.Render("  loading…")
 	}
 	if m.err != nil {
-		header += "  " + errStyle.Render(strings.Join(strings.Fields(m.err.Error()), " "))
+		msg := strings.Join(strings.Fields(m.err.Error()), " ")
+		if tracker.Retryable(m.err) {
+			msg += " · press r to retry"
+		}
+		header += "  " + errStyle.Render(msg)
 	}
 	return ansi.Truncate(header, m.w, "…")
 }
@@ -265,7 +265,7 @@ func (m model) viewColumns(height int) string {
 	render := func(i tracker.Issue, cursor bool) string {
 		c := m.card(i, cw-1, cursor)
 		bar := " "
-		if g := m.groupOf(i.Identifier); g != nil {
+		if g := m.groupOf(i.Key); g != nil {
 			bar = lipgloss.NewStyle().Foreground(groupColor(*g)).Render("┃")
 		}
 		return lipgloss.JoinHorizontal(lipgloss.Top, strings.TrimSuffix(strings.Repeat(bar+"\n", lipgloss.Height(c)), "\n"), c)
@@ -275,7 +275,7 @@ func (m model) viewColumns(height int) string {
 		col := m.cols[c]
 		count := len(col.items)
 		for _, i := range col.items {
-			count += max(0, len(m.collapsed[i.Identifier].issues)-1)
+			count += max(0, len(m.collapsed[i.Key].issues)-1)
 		}
 		head := lipgloss.NewStyle().Foreground(lipgloss.Color(col.state.Color)).Render("●") + " " + bold.Render(col.state.Name) + dim.Render(fmt.Sprintf(" %d", count))
 		lines := []string{ansi.Truncate(head, cw, "…")}
@@ -307,28 +307,28 @@ func (m model) viewColumns(height int) string {
 
 func (m model) card(i tracker.Issue, cw int, cursor bool) string {
 	inner := cw - 4
-	marked := slices.Contains(m.marked, i.Identifier)
-	meta := i.Identifier
+	marked := slices.Contains(m.marked, i.Key)
+	meta := i.Key
 	if marked {
-		meta = markStyle.Render("✓ " + i.Identifier)
+		meta = markStyle.Render("✓ " + i.Key)
 	}
-	if p := int(i.Priority); p > 0 && p < len(priorities) {
+	if p := i.Priority; p > 0 && p < len(priorities) {
 		meta += " " + prioStyle[p].Render(priorities[p])
 	}
-	if b := m.badge(m.sessionKeys(i.Identifier)...); b != "" {
+	if b := m.badge(m.sessionKeys(i.Key)...); b != "" {
 		meta += " " + b
 	}
-	if g := m.groupOf(i.Identifier); g != nil {
+	if g := m.groupOf(i.Key); g != nil {
 		meta += " " + lipgloss.NewStyle().Foreground(groupColor(*g)).Render("◆")
 	}
 	var mate lipgloss.Color
-	if sel := m.selectedIssue(); sel != nil && sel.Identifier != i.Identifier {
-		if g := m.groupOf(sel.Identifier); g != nil && slices.Contains(g.Tickets, i.Identifier) {
+	if sel := m.selectedIssue(); sel != nil && sel.Key != i.Key {
+		if g := m.groupOf(sel.Key); g != nil && slices.Contains(g.Tickets, i.Key) {
 			mate = groupColor(*g)
 		}
 	}
 	body := clampLines(i.Title, inner, 2)
-	if prs := m.prsFor(i.Identifier); len(prs) > 0 {
+	if prs := m.prsFor(i.Key); len(prs) > 0 {
 		tags := make([]string, len(prs))
 		for k, url := range prs {
 			tags[k] = prStyle.Render(github.PRTag(url))
@@ -336,23 +336,23 @@ func (m model) card(i tracker.Issue, cw int, cursor bool) string {
 		titleLines := min(2, len(strings.Split(ansi.Wordwrap(i.Title, inner, ""), "\n")))
 		body = clampLines(i.Title, inner, titleLines) + "\n" + ansi.Truncate(strings.Join(tags, " "), inner, "…")
 	}
-	if cg := m.collapsed[i.Identifier]; len(cg.issues) > 1 {
+	if cg := m.collapsed[i.Key]; len(cg.issues) > 1 {
 		ids := make([]string, len(cg.issues))
 		for k, x := range cg.issues {
-			ids[k] = x.Identifier
+			ids[k] = x.Key
 		}
 		meta = lipgloss.NewStyle().Foreground(groupColor(cg.Group)).Bold(true).Render(fmt.Sprintf("◆ %d cards", len(cg.issues)))
 		if b := m.badge(append(slices.Clone(ids), store.GroupKey(cg.ID))...); b != "" {
 			meta += " " + b
 		}
 		shown := cg.issues[m.frame/12%len(cg.issues)]
-		body = marquee(strings.Join(ids, " · "), inner, m.frame) + "\n" + ansi.Truncate(lipgloss.NewStyle().Foreground(groupColor(cg.Group)).Render(shown.Identifier)+" "+dim.Render(shown.Title), inner, "…")
+		body = marquee(strings.Join(ids, " · "), inner, m.frame) + "\n" + ansi.Truncate(lipgloss.NewStyle().Foreground(groupColor(cg.Group)).Render(shown.Key)+" "+dim.Render(shown.Title), inner, "…")
 	}
 	style := cardStyle
 	switch {
 	case cursor && m.focus == focusBoard && m.paneFocused:
 		style = style.Border(lipgloss.ThickBorder()).BorderForeground(focusColor)
-	case m.ticket != nil && m.ticket.Identifier == i.Identifier:
+	case m.ticket != nil && m.ticket.Key == i.Key:
 		style = style.BorderForeground(openColor)
 	case marked:
 		style = style.Border(lipgloss.DoubleBorder()).BorderForeground(markColor)
@@ -405,8 +405,8 @@ func clampLines(s string, width, n int) string {
 func (m model) stripTop() string {
 	w := m.inner()
 	i := m.ticket
-	head := bold.Render(i.Identifier) + dim.Render(" · "+i.State.Name)
-	if p := int(i.Priority); p > 0 && p < len(priorities) {
+	head := bold.Render(i.Key) + dim.Render(" · "+i.State.Name)
+	if p := i.Priority; p > 0 && p < len(priorities) {
 		head += dim.Render(" · ") + prioStyle[p].Render(priorities[p])
 	}
 	lines := append([]string{ansi.Truncate(head+"  "+i.Title, w, "…")}, m.sessionLines()...)
@@ -464,7 +464,7 @@ func (m model) sessionLines() []string {
 
 var (
 	priorities = []string{"", "urgent", "high", "medium", "low"}
-	stateOrder = map[string]int{"triage": 0, "backlog": 1, "unstarted": 2, "started": 3, "completed": 4, "canceled": 5}
+	stateOrder = map[string]int{tracker.Triage: 0, tracker.Backlog: 1, tracker.Unstarted: 2, tracker.Started: 3, tracker.Completed: 4, tracker.Canceled: 5}
 	stateRank  = map[string]int{"stopped": 0, "background": 1, "working": 2, "waiting": 3}
 
 	accent     = lipgloss.Color("#5e6ad2")

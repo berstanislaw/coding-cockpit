@@ -13,7 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func Run() error {
+func Run(t tracker.Client) error {
 	sessions, groups, err := store.LoadState()
 	if err != nil {
 		return err
@@ -33,7 +33,7 @@ func Run() error {
 	pick := textinput.New()
 	pick.Prompt = "> "
 	pick.Placeholder = "type to filter, or a new name"
-	m := model{sessions: sessions, groups: groups, settings: settings, live: map[string]string{}, status: map[string]string{}, search: search, ta: ta, vp: viewport.New(0, 0), loading: true, paneFocused: true,
+	m := model{tracker: t, sessions: sessions, groups: groups, settings: settings, live: map[string]string{}, status: map[string]string{}, search: search, ta: ta, vp: viewport.New(0, 0), loading: true, paneFocused: true,
 		reviews: map[string]*review.Review{}, busy: map[string]bool{}, generating: map[string]bool{}, sending: map[string]bool{}, ask: ask, pick: pick, rvp: viewport.New(0, 0)}
 	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus()).Run()
 	return err
@@ -64,6 +64,7 @@ type model struct {
 	w, h        int
 	tab         tab
 	focus       focus
+	tracker     tracker.Client
 	issues      []tracker.Issue
 	cols        []column
 	col, row    int
@@ -82,7 +83,7 @@ type model struct {
 	loading     bool
 	paneFocused bool
 	err         error
-	linearPRs   map[string][]string
+	ticketPRs   map[string][]string
 	daily       string
 	dailyAt     time.Time
 	dailyBusy   bool
